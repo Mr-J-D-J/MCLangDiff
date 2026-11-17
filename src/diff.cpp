@@ -206,6 +206,8 @@ bool CompareFiles(const std::wstring& oldPath, const std::wstring& newPath,
     AppendSection(report, "[C] 值变更 / Changed", result->statsChanged, result->blockChanged);
 
     result->fullReport = std::move(report);
+    result->oldFile = std::move(oldFile);
+    result->newFile = std::move(newFile);
     out = std::move(result);
     return true;
 }

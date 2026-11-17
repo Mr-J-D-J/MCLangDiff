@@ -91,15 +91,19 @@ private:
             return Fail("顶层必须是对象，并以 '{' 开头");
         }
         ++pos_;
+        file_.prefix = text_.substr(0, pos_);
+        size_t leadStart = pos_;
+
         SkipWhitespace();
         if (pos_ < text_.size() && text_[pos_] == '}') {
+            file_.suffix = text_.substr(leadStart);
             ++pos_;
             SkipWhitespace();
             return pos_ == text_.size() ? true : Fail("对象结束后存在多余内容");
         }
 
+        size_t lastRawEnd = leadStart;
         while (true) {
-            SkipWhitespace();
             const size_t keyStart = pos_;
             std::string_view key;
             if (!ParseString(key)) {
@@ -131,8 +135,10 @@ private:
             entry.value = value;
             entry.raw = text_.substr(keyStart, rawEnd - keyStart);
             entry.indent = indent;
+            entry.lead = text_.substr(leadStart, keyStart - leadStart);
             entry.line = line_;
             file_.entries.push_back(entry);
+            lastRawEnd = rawEnd;
 
             SkipWhitespace();
             if (pos_ >= text_.size()) {
@@ -140,6 +146,7 @@ private:
             }
             if (text_[pos_] == ',') {
                 ++pos_;
+                leadStart = pos_;
                 SkipWhitespace();
                 if (pos_ < text_.size() && text_[pos_] == '}') {
                     return Fail("对象末尾存在多余的逗号");
@@ -153,6 +160,7 @@ private:
             return Fail("键值对之间缺少 ','，或对象缺少 '}'");
         }
 
+        file_.suffix = text_.substr(lastRawEnd);
         SkipWhitespace();
         if (pos_ != text_.size()) {
             return Fail("对象结束后存在多余内容");
@@ -205,72 +213,10 @@ private:
     }
 
     bool DecodeEscapes(std::string_view content, std::string& out) {
-        size_t i = 0;
-        while (i < content.size()) {
-            const char c = content[i++];
-            if (c != '\\') {
-                out.push_back(c);
-                continue;
-            }
-            if (i >= content.size()) {
-                return Fail("字符串以孤立的反斜杠结尾");
-            }
-            const char escape = content[i++];
-            switch (escape) {
-                case '"': out.push_back('"'); break;
-                case '\\': out.push_back('\\'); break;
-                case '/': out.push_back('/'); break;
-                case 'b': out.push_back('\b'); break;
-                case 'f': out.push_back('\f'); break;
-                case 'n': out.push_back('\n'); break;
-                case 'r': out.push_back('\r'); break;
-                case 't': out.push_back('\t'); break;
-                case 'u': {
-                    uint32_t codePoint = 0;
-                    if (!ReadHex4(content, i, codePoint)) {
-                        return false;
-                    }
-                    if (codePoint >= 0xD800 && codePoint <= 0xDBFF) {
-                        // 高代理项：必须紧跟 \uXXXX 形式的低代理项。
-                        if (i + 2 > content.size() || content[i] != '\\' || content[i + 1] != 'u') {
-                            return Fail("无效的 \\u 转义：高代理项缺少配对的低代理项");
-                        }
-                        i += 2;
-                        uint32_t low = 0;
-                        if (!ReadHex4(content, i, low)) {
-                            return false;
-                        }
-                        if (low < 0xDC00 || low > 0xDFFF) {
-                            return Fail("无效的 \\u 转义：低代理项超出范围");
-                        }
-                        codePoint = 0x10000 + ((codePoint - 0xD800) << 10) + (low - 0xDC00);
-                    } else if (codePoint >= 0xDC00 && codePoint <= 0xDFFF) {
-                        return Fail("无效的 \\u 转义：孤立的低代理项");
-                    }
-                    EncodeUtf8(codePoint, out);
-                    break;
-                }
-                default:
-                    return Fail(std::string("无效的转义序列 \\") + escape);
-            }
+        std::string decodeError;
+        if (!DecodeJsonEscapes(content, out, decodeError)) {
+            return Fail(decodeError);
         }
-        return true;
-    }
-
-    bool ReadHex4(std::string_view content, size_t& index, uint32_t& value) {
-        if (index + 4 > content.size()) {
-            return Fail("\\u 转义缺少 4 位十六进制数字");
-        }
-        uint32_t result = 0;
-        for (int k = 0; k < 4; ++k) {
-            const int digit = HexDigit(content[index + static_cast<size_t>(k)]);
-            if (digit < 0) {
-                return Fail("\\u 转义包含非十六进制字符");
-            }
-            result = (result << 4) | static_cast<uint32_t>(digit);
-        }
-        index += 4;
-        value = result;
         return true;
     }
 
@@ -368,6 +314,84 @@ std::wstring ResolveFinalPath(const std::wstring& path) {
 }
 
 }  // namespace
+
+bool DecodeJsonEscapes(std::string_view content, std::string& out, std::string& err) {
+    size_t i = 0;
+    while (i < content.size()) {
+        const char c = content[i++];
+        if (c != '\\') {
+            out.push_back(c);
+            continue;
+        }
+        if (i >= content.size()) {
+            err = "字符串以孤立的反斜杠结尾";
+            return false;
+        }
+
+        const char escape = content[i++];
+        switch (escape) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                auto readHex4 = [&](uint32_t& value) -> bool {
+                    if (i + 4 > content.size()) {
+                        err = "\\u 转义缺少 4 位十六进制数字";
+                        return false;
+                    }
+                    uint32_t result = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        const int digit = HexDigit(content[i + static_cast<size_t>(k)]);
+                        if (digit < 0) {
+                            err = "\\u 转义包含非十六进制字符";
+                            return false;
+                        }
+                        result = (result << 4) | static_cast<uint32_t>(digit);
+                    }
+                    i += 4;
+                    value = result;
+                    return true;
+                };
+
+                uint32_t codePoint = 0;
+                if (!readHex4(codePoint)) {
+                    return false;
+                }
+                if (codePoint >= 0xD800 && codePoint <= 0xDBFF) {
+                    // 高代理项：必须紧跟 \uXXXX 形式的低代理项。
+                    if (i + 2 > content.size() || content[i] != '\\' || content[i + 1] != 'u') {
+                        err = "无效的 \\u 转义：高代理项缺少配对的低代理项";
+                        return false;
+                    }
+                    i += 2;
+                    uint32_t low = 0;
+                    if (!readHex4(low)) {
+                        return false;
+                    }
+                    if (low < 0xDC00 || low > 0xDFFF) {
+                        err = "无效的 \\u 转义：低代理项超出范围";
+                        return false;
+                    }
+                    codePoint = 0x10000 + ((codePoint - 0xD800) << 10) + (low - 0xDC00);
+                } else if (codePoint >= 0xDC00 && codePoint <= 0xDFFF) {
+                    err = "无效的 \\u 转义：孤立的低代理项";
+                    return false;
+                }
+                EncodeUtf8(codePoint, out);
+                break;
+            }
+            default:
+                err = std::string("无效的转义序列 \\") + escape;
+                return false;
+        }
+    }
+    return true;
+}
 
 FileFormat FormatFromPath(const std::wstring& path) {
     const size_t dot = path.find_last_of(L'.');

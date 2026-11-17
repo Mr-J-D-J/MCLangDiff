@@ -89,6 +89,7 @@ $compileArgs = @(
     (Join-Path $src 'lang_file.cpp'),
     (Join-Path $src 'diff.cpp'),
     (Join-Path $src 'util.cpp'),
+    (Join-Path $src 'update_file.cpp'),
     '-o', (Join-Path $tmp 'core_tests.exe'),
     '-static', '-static-libgcc', '-static-libstdc++'
 )

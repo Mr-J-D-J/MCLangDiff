@@ -11,6 +11,7 @@
 #include "diff.h"
 #include "hash.h"
 #include "lang_file.h"
+#include "update_file.h"
 #include "util.h"
 
 namespace {
@@ -202,6 +203,225 @@ int wmain() {
         CHECK_NOT_CONTAINS(langDiff->blockAdded, "##");
         CHECK_NOT_CONTAINS(langDiff->blockAdded, "统计");
     }
+
+    std::printf("== 粘贴块解析 ==\n");
+    {
+        mcd::PastedBlock wrapped;
+        CHECK(mcd::ParsePastedBlock("{ \"a\": \"1\", }", mcd::FileFormat::Json, wrapped, err));
+        CHECK_SIZE(wrapped.entries.size(), 1);
+        CHECK(wrapped.entries[0].key == "a");
+        CHECK(wrapped.entries[0].raw == "\"a\": \"1\"");
+
+        mcd::PastedBlock emptyBlock;
+        CHECK(mcd::ParsePastedBlock("   ", mcd::FileFormat::Json, emptyBlock, err));
+        CHECK_SIZE(emptyBlock.entries.size(), 0);
+
+        mcd::PastedBlock escapedKey;
+        CHECK(mcd::ParsePastedBlock("\"a\\u0062\": \"x\"", mcd::FileFormat::Json, escapedKey, err));
+        CHECK_SIZE(escapedKey.entries.size(), 1);
+        CHECK(escapedKey.entries[0].key == "ab");
+
+        mcd::PastedBlock badJson;
+        CHECK(!mcd::ParsePastedBlock("\"a\": 1", mcd::FileFormat::Json, badJson, err));
+        CHECK_CONTAINS(err, "值必须是字符串");
+
+        mcd::PastedBlock duplicateJson;
+        CHECK(!mcd::ParsePastedBlock("\"a\": \"1\", \"a\": \"2\"", mcd::FileFormat::Json,
+                                     duplicateJson, err));
+        CHECK_CONTAINS(err, "重复");
+
+        mcd::PastedBlock langBlock;
+        CHECK(mcd::ParsePastedBlock("## 注释\n\nb=2\na=1\n", mcd::FileFormat::Lang, langBlock, err));
+        CHECK_SIZE(langBlock.entries.size(), 2);
+        CHECK(langBlock.entries[0].key == "b");
+        CHECK(langBlock.entries[1].raw == "a=1");
+
+        mcd::PastedBlock badLang;
+        CHECK(!mcd::ParsePastedBlock("key_without_separator\n", mcd::FileFormat::Lang, badLang, err));
+        CHECK_CONTAINS(err, "缺少 '='");
+    }
+
+    std::printf("== 更新操作文件（JSON） ==\n");
+    const std::wstring sampleJsonTarget = samples + L"\\zh_cn.json";
+    const std::wstring targetJson = PathJoin(tmpDir, L"zh_cn.json");
+    CHECK(CopyFileW(sampleJsonTarget.c_str(), targetJson.c_str(), FALSE) != FALSE);
+
+    mcd::PastedBlock updateJson;
+    const std::string updateJsonText =
+        "\"block.demo.new_block.name\": \"新方块\",\n"
+        "\"gui.demo.close\": \"关闭界面\",\n"
+        "\"gui.demo.settings\": \"设置\",\n"
+        "\"item.demo.new_only.name\" : \"仅存在于新文件\",\n"
+        "\"item.demo.pickaxe.name\": \"演示镐（强化）\"";
+    CHECK(mcd::ParsePastedBlock(updateJsonText, mcd::FileFormat::Json, updateJson, err));
+    CHECK_SIZE(updateJson.entries.size(), 5);
+
+    mcd::UpdateStats jsonStats;
+    CHECK(mcd::ApplyTranslationUpdate(targetJson, *jsonDiff, updateJson, jsonStats, err));
+    CHECK_SIZE(jsonStats.inserted, 4);
+    CHECK_SIZE(jsonStats.updated, 1);
+    CHECK_SIZE(jsonStats.removed, 2);
+    CHECK_SIZE(jsonStats.untouched, 6);
+    CHECK_SIZE(jsonStats.totalAfter, 11);
+
+    std::string updatedJsonBytes;
+    CHECK(mcd::ReadFileBytes(targetJson, updatedJsonBytes, mcd::kMaxFileBytes, err));
+    CHECK(!(updatedJsonBytes.size() >= 3 &&
+            static_cast<unsigned char>(updatedJsonBytes[0]) == 0xEF &&
+            static_cast<unsigned char>(updatedJsonBytes[1]) == 0xBB &&
+            static_cast<unsigned char>(updatedJsonBytes[2]) == 0xBF));
+    CHECK(updatedJsonBytes.rfind("{\n  \"item.demo.sword.name\"", 0) == 0);
+
+    auto updatedJson = std::make_unique<mcd::LangFile>();
+    CHECK(mcd::LoadLangFile(targetJson, mcd::FileFormat::Json, *updatedJson, err));
+    CHECK_SIZE(updatedJson->entries.size(), 11);
+    auto jsonEntryIndex = [&updatedJson](std::string_view key) -> int {
+        const auto it = updatedJson->index.find(key);
+        return it == updatedJson->index.end() ? -1 : static_cast<int>(it->second);
+    };
+    CHECK(jsonEntryIndex("item.demo.sword.name") == 0);
+    CHECK(jsonEntryIndex("item.demo.pickaxe.name") == 1);
+    CHECK(jsonEntryIndex("item.demo.gem.name") == 2);
+    CHECK(jsonEntryIndex("block.demo.lamp.name") == 3);
+    CHECK(jsonEntryIndex("block.demo.new_block.name") == 4);
+    CHECK(jsonEntryIndex("gui.demo.title") == 5);
+    CHECK(jsonEntryIndex("gui.demo.close") == 6);
+    CHECK(jsonEntryIndex("gui.demo.settings") == 7);
+    CHECK(jsonEntryIndex("message.demo.welcome") == 8);
+    CHECK(jsonEntryIndex("item.demo.new_only.name") == 9);
+    CHECK(jsonEntryIndex("item.demo.extra.name") == 10);
+    CHECK(jsonEntryIndex("gui.demo.legacy") == -1);
+    CHECK(jsonEntryIndex("item.demo.old_only.name") == -1);
+    CHECK(updatedJson->entries[6].value == "关闭界面");
+    CHECK(updatedJson->entries[7].value == "设置");
+    CHECK(updatedJson->entries[10].raw == "\"item.demo.extra.name\": \"中文额外条目\"");
+    CHECK(updatedJson->entries[10].lead == "\n  ");
+    CHECK(updatedJson->entries[9].lead == "\n  ");
+    CHECK(updatedJson->entries[9].raw == "\"item.demo.new_only.name\" : \"仅存在于新文件\"");
+
+    std::printf("== 更新校验与失败保护 ==\n");
+    const std::wstring guardJson = PathJoin(tmpDir, L"zh_cn_guard.json");
+    CHECK(CopyFileW(sampleJsonTarget.c_str(), guardJson.c_str(), FALSE) != FALSE);
+    std::string guardBefore;
+    CHECK(mcd::ReadFileBytes(guardJson, guardBefore, mcd::kMaxFileBytes, err));
+
+    mcd::PastedBlock missingBlock;
+    CHECK(mcd::ParsePastedBlock(
+        "\"block.demo.new_block.name\": \"新方块\",\n"
+        "\"gui.demo.close\": \"关闭界面\",\n"
+        "\"item.demo.pickaxe.name\": \"演示镐（强化）\"",
+        mcd::FileFormat::Json, missingBlock, err));
+    mcd::UpdateStats ignoredStats;
+    CHECK(!mcd::ApplyTranslationUpdate(guardJson, *jsonDiff, missingBlock, ignoredStats, err));
+    CHECK_CONTAINS(err, "缺少");
+    CHECK_CONTAINS(err, "item.demo.new_only.name");
+    std::string guardAfter;
+    CHECK(mcd::ReadFileBytes(guardJson, guardAfter, mcd::kMaxFileBytes, err));
+    CHECK(guardBefore == guardAfter);
+
+    mcd::PastedBlock unknownBlock;
+    CHECK(mcd::ParsePastedBlock(updateJsonText + ",\n\"item.demo.gem.name\": \"红宝石\"",
+                                mcd::FileFormat::Json, unknownBlock, err));
+    CHECK(!mcd::ApplyTranslationUpdate(guardJson, *jsonDiff, unknownBlock, ignoredStats, err));
+    CHECK_CONTAINS(err, "不在新增/值变更");
+    CHECK(mcd::ReadFileBytes(guardJson, guardAfter, mcd::kMaxFileBytes, err));
+    CHECK(guardBefore == guardAfter);
+
+    mcd::UpdateStats mismatchStats;
+    CHECK(!mcd::ApplyTranslationUpdate(samples + L"\\zh_cn.lang", *jsonDiff, updateJson,
+                                       mismatchStats, err));
+    CHECK_CONTAINS(err, "格式不一致");
+
+    std::printf("== 更新写入：无 BOM ==\n");
+    const std::wstring bomTarget = PathJoin(tmpDir, L"zh_cn_bom.json");
+    std::string sampleJsonBytes;
+    CHECK(mcd::ReadFileBytes(sampleJsonTarget, sampleJsonBytes, mcd::kMaxFileBytes, err));
+    CHECK(WriteBytes(bomTarget, std::string("\xEF\xBB\xBF") + sampleJsonBytes));
+    mcd::UpdateStats bomStats;
+    CHECK(mcd::ApplyTranslationUpdate(bomTarget, *jsonDiff, updateJson, bomStats, err));
+    std::string bomBytes;
+    CHECK(mcd::ReadFileBytes(bomTarget, bomBytes, mcd::kMaxFileBytes, err));
+    CHECK(!(bomBytes.size() >= 3 && static_cast<unsigned char>(bomBytes[0]) == 0xEF &&
+            static_cast<unsigned char>(bomBytes[1]) == 0xBB &&
+            static_cast<unsigned char>(bomBytes[2]) == 0xBF));
+    CHECK_CONTAINS(bomBytes, "\"item.demo.new_only.name\" : \"仅存在于新文件\"");
+
+    std::printf("== 更新操作文件（LANG，CRLF 与注释保留） ==\n");
+    const std::wstring sampleLangTarget = samples + L"\\zh_cn.lang";
+    const std::wstring targetLang = PathJoin(tmpDir, L"zh_cn.lang");
+    std::string sampleLangBytes;
+    CHECK(mcd::ReadFileBytes(sampleLangTarget, sampleLangBytes, mcd::kMaxFileBytes, err));
+    std::string crlfBytes;
+    crlfBytes.reserve(sampleLangBytes.size() + sampleLangBytes.size() / 8);
+    for (size_t i = 0; i < sampleLangBytes.size(); ++i) {
+        const char c = sampleLangBytes[i];
+        if (c == '\n' && (i == 0 || sampleLangBytes[i - 1] != '\r')) {
+            crlfBytes.push_back('\r');
+        }
+        crlfBytes.push_back(c);
+    }
+    CHECK(WriteBytes(targetLang, crlfBytes));
+
+    mcd::PastedBlock updateLang;
+    const std::string updateLangText =
+        "item.demo.pickaxe.name=演示镐（强化）\n"
+        "block.demo.new_block.name=新方块\n"
+        "gui.demo.close=关闭界面\n"
+        "gui.demo.settings=设置\n"
+        "item.demo.new_only.name=仅存在于新文件\n";
+    CHECK(mcd::ParsePastedBlock(updateLangText, mcd::FileFormat::Lang, updateLang, err));
+    CHECK_SIZE(updateLang.entries.size(), 5);
+
+    mcd::UpdateStats langStats;
+    CHECK(mcd::ApplyTranslationUpdate(targetLang, *langDiff, updateLang, langStats, err));
+    CHECK_SIZE(langStats.inserted, 4);
+    CHECK_SIZE(langStats.updated, 1);
+    CHECK_SIZE(langStats.removed, 2);
+    CHECK_SIZE(langStats.untouched, 6);
+    CHECK_SIZE(langStats.totalAfter, 11);
+
+    std::string updatedLangBytes;
+    CHECK(mcd::ReadFileBytes(targetLang, updatedLangBytes, mcd::kMaxFileBytes, err));
+    size_t loneLf = 0;
+    for (size_t i = 0; i < updatedLangBytes.size(); ++i) {
+        if (updatedLangBytes[i] == '\n' && (i == 0 || updatedLangBytes[i - 1] != '\r')) {
+            ++loneLf;
+        }
+    }
+    CHECK_SIZE(loneLf, 0);
+    CHECK_CONTAINS(updatedLangBytes, "## zh_cn 操作文件示例");
+    CHECK_CONTAINS(updatedLangBytes, "# 更新时会保留注释与未涉及的条目");
+    CHECK_CONTAINS(updatedLangBytes,
+                   "item.demo.sword.name=演示之剑\r\nitem.demo.pickaxe.name=演示镐（强化）\r\n"
+                   "item.demo.gem.name=红宝石");
+    CHECK_CONTAINS(updatedLangBytes,
+                   "gui.demo.title=演示界面\r\ngui.demo.close=关闭界面\r\n"
+                   "gui.demo.settings=设置\r\nmessage.demo.welcome=欢迎来到演示世界！");
+    CHECK_CONTAINS(updatedLangBytes,
+                   "message.demo.welcome=欢迎来到演示世界！\r\nitem.demo.new_only.name=仅存在于新文件\r\n"
+                   "item.demo.extra.name=中文额外条目");
+    CHECK_NOT_CONTAINS(updatedLangBytes, "gui.demo.legacy");
+    CHECK_NOT_CONTAINS(updatedLangBytes, "item.demo.old_only.name");
+
+    auto updatedLang = std::make_unique<mcd::LangFile>();
+    CHECK(mcd::LoadLangFile(targetLang, mcd::FileFormat::Lang, *updatedLang, err));
+    CHECK_SIZE(updatedLang->entries.size(), 11);
+    CHECK(updatedLang->entries[1].key == "item.demo.pickaxe.name");
+    CHECK(updatedLang->entries[1].value == "演示镐（强化）");
+
+    std::printf("== 更新操作文件（LANG，保留无末尾换行） ==\n");
+    const std::wstring noEolLang = PathJoin(tmpDir, L"zh_cn_no_eol.lang");
+    std::string noEolBytes = sampleLangBytes;
+    while (!noEolBytes.empty() && (noEolBytes.back() == '\n' || noEolBytes.back() == '\r')) {
+        noEolBytes.pop_back();
+    }
+    CHECK(WriteBytes(noEolLang, noEolBytes));
+    mcd::UpdateStats noEolStats;
+    CHECK(mcd::ApplyTranslationUpdate(noEolLang, *langDiff, updateLang, noEolStats, err));
+    std::string noEolAfter;
+    CHECK(mcd::ReadFileBytes(noEolLang, noEolAfter, mcd::kMaxFileBytes, err));
+    CHECK(!noEolAfter.empty() && noEolAfter.back() != '\n');
+    CHECK_CONTAINS(noEolAfter, "item.demo.extra.name=中文额外条目");
 
     std::printf("== 错误处理 ==\n");
     std::unique_ptr<mcd::DiffResult> mismatch;

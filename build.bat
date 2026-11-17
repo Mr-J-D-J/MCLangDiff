@@ -27,7 +27,7 @@ if errorlevel 1 goto :fail
 
 echo [2/3] Compiling sources...
 %CXX% -std=c++17 -O2 -municode -mwindows -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -D_WIN32_IE=0x0A00 -finput-charset=UTF-8 -Wall -Wextra ^
-    "%SRC%\main.cpp" "%SRC%\app.cpp" "%SRC%\lang_file.cpp" "%SRC%\diff.cpp" "%SRC%\util.cpp" ^
+    "%SRC%\main.cpp" "%SRC%\app.cpp" "%SRC%\lang_file.cpp" "%SRC%\diff.cpp" "%SRC%\util.cpp" "%SRC%\update_file.cpp" ^
     "%OBJ%\app_res.o" -o "%OUT%\MCLangDiff.exe" ^
     -static -static-libgcc -static-libstdc++ -lcomctl32 -lcomdlg32 -lshell32 -lgdi32 -luser32
 if errorlevel 1 goto :fail

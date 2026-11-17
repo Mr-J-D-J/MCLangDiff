@@ -41,6 +41,10 @@ struct DiffResult {
 
     std::string fullReport;
     double elapsedMs = 0.0;
+
+    // 保留解析后的源文件，供“更新 zh_cn 操作文件”按新文件位置注入条目。
+    std::unique_ptr<LangFile> oldFile;
+    std::unique_ptr<LangFile> newFile;
 };
 
 // 读取并比较两个语言文件。成功时 out 指向新结果，失败时 err 为 UTF-8 错误信息。

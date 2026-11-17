@@ -1,0 +1,11 @@
+{
+  "item.demo.sword.name": "演示之剑",
+  "item.demo.gem.name": "红宝石",
+  "block.demo.lamp.name": "红石灯",
+  "gui.demo.title": "演示界面",
+  "gui.demo.close": "关闭",
+  "gui.demo.legacy": "旧版按钮",
+  "message.demo.welcome": "欢迎来到演示世界！",
+  "item.demo.old_only.name": "仅存在于旧文件",
+  "item.demo.extra.name": "中文额外条目"
+}

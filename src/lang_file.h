@@ -22,6 +22,7 @@ struct Entry {
     std::string_view value;   // 解码后的值（JSON 转义已还原），用于比较
     std::string_view raw;     // 原始条目文本：JSON 为 "key": "value"；LANG 为整行
     std::string_view indent;  // JSON 条目所在行的前导空白；LANG 为空
+    std::string_view lead;    // JSON 条目之前的空白（含换行与缩进）；LANG 为空
     uint32_t line = 1;        // 起始行号（从 1 开始）
 };
 
@@ -33,6 +34,8 @@ struct LangFile {
     std::deque<std::string> decoded;  // 存放转义解码后的字符串（引用稳定）
     std::vector<Entry> entries;       // 保持文件中的出现顺序
     std::unordered_map<std::string_view, uint32_t, KeyHash> index;
+    std::string_view prefix;  // JSON：文件开头到 '{'（含）；LANG 为空
+    std::string_view suffix;  // JSON：最后一个条目结束后的内容；LANG 为空
     uint64_t byteSize = 0;
     std::string path;  // UTF-8
 
@@ -55,5 +58,9 @@ bool LoadLangFile(const std::wstring& path, FileFormat expected, LangFile& out, 
 
 // 判断两个路径是否指向同一个文件（解析为最终路径后忽略大小写比较）。
 bool IsSameFile(const std::wstring& first, const std::wstring& second);
+
+// 解码 JSON 字符串内部的转义序列（content 不含两侧引号），结果追加到 out。
+// 失败时返回 false 并填充 err。
+bool DecodeJsonEscapes(std::string_view content, std::string& out, std::string& err);
 
 }  // namespace mcd
