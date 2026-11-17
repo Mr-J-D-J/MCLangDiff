@@ -1,0 +1,1484 @@
+#include "app.h"
+
+#include <commctrl.h>
+#include <commdlg.h>
+#include <shellapi.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <cwchar>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "diff.h"
+#include "lang_file.h"
+#include "util.h"
+
+namespace {
+
+using mcd::DiffResult;
+using mcd::FileFormat;
+
+// ---------------------------------------------------------------- 常量与配色
+
+enum ControlId : int {
+    kIdZoneOld = 1001,
+    kIdZoneNew = 1002,
+    kIdClearOld = 1010,
+    kIdClearNew = 1011,
+    kIdSwap = 1012,
+    kIdCompare = 1013,
+    kIdTab = 1020,
+    kIdEditAdded = 1021,
+    kIdEditRemoved = 1022,
+    kIdEditChanged = 1023,
+    kIdCopyBlock = 1030,
+    kIdCopyAll = 1031,
+    kIdExport = 1032,
+    kIdProgress = 1040
+};
+
+constexpr UINT kMsgZoneFile = WM_APP + 1;
+constexpr UINT kMsgZoneClick = WM_APP + 2;
+constexpr UINT kMsgCompareDone = WM_APP + 3;
+
+const wchar_t kZoneClassName[] = L"MCLangDiff.DropZone";
+const wchar_t kMainClassName[] = L"MCLangDiff.Main";
+
+constexpr COLORREF kBg = RGB(245, 246, 248);
+constexpr COLORREF kPanel = RGB(255, 255, 255);
+constexpr COLORREF kBorder = RGB(219, 224, 232);
+constexpr COLORREF kText = RGB(24, 32, 44);
+constexpr COLORREF kMuted = RGB(110, 120, 134);
+constexpr COLORREF kOldAccent = RGB(217, 119, 6);
+constexpr COLORREF kNewAccent = RGB(37, 99, 235);
+constexpr COLORREF kGreen = RGB(21, 128, 61);
+constexpr COLORREF kRed = RGB(185, 28, 28);
+constexpr COLORREF kAmber = RGB(180, 83, 9);
+constexpr COLORREF kPrimary = RGB(37, 99, 235);
+constexpr COLORREF kPrimaryHover = RGB(29, 78, 216);
+constexpr COLORREF kPrimaryDisabled = RGB(191, 208, 245);
+
+const wchar_t* const kUiFace = L"Microsoft YaHei UI";
+const wchar_t* const kMonoFace = L"Consolas";
+
+// ---------------------------------------------------------------- 数据结构
+
+struct ZoneState {
+    std::wstring path;
+    std::wstring name;
+    FileFormat format = FileFormat::Unknown;
+    uint64_t bytes = 0;
+    bool valid = false;
+};
+
+struct CompareJob {
+    bool ok = false;
+    std::string error;
+    std::unique_ptr<DiffResult> result;
+};
+
+struct App;
+
+struct ZoneContext {
+    App* app = nullptr;
+    int index = 0;
+};
+
+struct App {
+    HINSTANCE instance = nullptr;
+    HWND hwnd = nullptr;
+
+    HWND zoneHwnd[2] = {};
+    HWND btnClear[2] = {};
+    HWND btnSwap = nullptr;
+    HWND btnCompare = nullptr;
+    HWND tab = nullptr;
+    HWND edits[3] = {};
+    HWND progress = nullptr;
+    HWND btnCopyBlock = nullptr;
+    HWND btnCopyAll = nullptr;
+    HWND btnExport = nullptr;
+
+    ZoneState zones[2];
+    std::unique_ptr<DiffResult> result;
+    std::thread worker;
+    bool comparing = false;
+    bool compact = false;
+    int activeTab = 0;
+
+    RECT workArea{};
+    UINT dpi = 96;
+    HFONT fTitle = nullptr;
+    HFONT fZoneName = nullptr;
+    HFONT fZoneHint = nullptr;
+    HFONT fUi = nullptr;
+    HFONT fUiBold = nullptr;
+    HFONT fButton = nullptr;
+    HFONT fSmall = nullptr;
+    HFONT fSmallBold = nullptr;
+    HFONT fMono = nullptr;
+    HFONT fPanelHint = nullptr;
+
+    HBRUSH bgBrush = nullptr;
+    HBRUSH panelBrush = nullptr;
+
+    std::wstring statText[3];
+    std::wstring status;
+    COLORREF statusColor = kText;
+
+    bool zoneHover[2] = {false, false};
+    std::unordered_map<HWND, bool> buttonHover;
+
+    RECT rcHeader{};
+    RECT rcZones[2]{};
+    RECT rcStatus{};
+    RECT rcProgress{};
+    RECT rcTab{};
+    RECT rcCard{};
+    RECT rcStats{};
+    RECT rcEdit{};
+    RECT rcBottom{};
+    RECT rcBottomHint{};
+
+    ~App() {
+        if (worker.joinable()) {
+            worker.detach();
+        }
+        auto dropFont = [](HFONT& font) {
+            if (font != nullptr) {
+                DeleteObject(font);
+                font = nullptr;
+            }
+        };
+        dropFont(fTitle);
+        dropFont(fZoneName);
+        dropFont(fZoneHint);
+        dropFont(fUi);
+        dropFont(fUiBold);
+        dropFont(fButton);
+        dropFont(fSmall);
+        dropFont(fSmallBold);
+        dropFont(fMono);
+        dropFont(fPanelHint);
+        if (bgBrush != nullptr) {
+            DeleteObject(bgBrush);
+        }
+        if (panelBrush != nullptr) {
+            DeleteObject(panelBrush);
+        }
+    }
+};
+
+App* g_app = nullptr;
+
+// ---------------------------------------------------------------- 绘制辅助
+
+int S(const App& app, int value) {
+    return MulDiv(value, static_cast<int>(app.dpi), 96);
+}
+
+COLORREF Mix(COLORREF base, COLORREF overlay, int overlayPercent) {
+    const int keep = 100 - overlayPercent;
+    return RGB((GetRValue(base) * keep + GetRValue(overlay) * overlayPercent) / 100,
+               (GetGValue(base) * keep + GetGValue(overlay) * overlayPercent) / 100,
+               (GetBValue(base) * keep + GetBValue(overlay) * overlayPercent) / 100);
+}
+
+void FillSolidRect(HDC dc, const RECT& rc, COLORREF color) {
+    const HBRUSH brush = CreateSolidBrush(color);
+    FillRect(dc, &rc, brush);
+    DeleteObject(brush);
+}
+
+void FrameRect1(HDC dc, RECT rc, COLORREF color) {
+    const HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+void FillRoundRect(HDC dc, const RECT& rc, int radius, COLORREF fill, COLORREF border) {
+    const HBRUSH brush = CreateSolidBrush(fill);
+    const HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ oldBrush = SelectObject(dc, brush);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius * 2, radius * 2);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+
+void DrawTextIn(HDC dc, std::wstring_view text, RECT rc, HFONT font, COLORREF color, UINT flags) {
+    if (text.empty() || font == nullptr) {
+        return;
+    }
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.data(), static_cast<int>(text.size()), &rc, flags);
+    SelectObject(dc, oldFont);
+}
+
+void DrawDot(HDC dc, int centerX, int centerY, int radius, COLORREF color) {
+    const HBRUSH brush = CreateSolidBrush(color);
+    HGDIOBJ oldBrush = SelectObject(dc, brush);
+    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+    Ellipse(dc, centerX - radius, centerY - radius, centerX + radius, centerY + radius);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(brush);
+}
+
+std::wstring FormatLabel(FileFormat format) {
+    switch (format) {
+        case FileFormat::Json: return L"JSON";
+        case FileFormat::Lang: return L"LANG";
+        default: return L"未知";
+    }
+}
+
+COLORREF TabAccent(int tab) {
+    switch (tab) {
+        case 1: return kRed;
+        case 2: return kAmber;
+        default: return kGreen;
+    }
+}
+
+// ---------------------------------------------------------------- 字体
+
+HFONT CreateFontFor(UINT dpi, int tenthPoints, bool bold, const wchar_t* face) {
+    LOGFONTW lf{};
+    lf.lfHeight = -MulDiv(tenthPoints, static_cast<int>(dpi), 720);
+    lf.lfWeight = bold ? FW_SEMIBOLD : FW_NORMAL;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    lstrcpynW(lf.lfFaceName, face, LF_FACESIZE);
+    return CreateFontIndirectW(&lf);
+}
+
+void CreateAppFonts(App& app) {
+    const bool compact = app.compact;
+    app.fTitle = CreateFontFor(app.dpi, compact ? 140 : 190, true, kUiFace);
+    app.fZoneName = CreateFontFor(app.dpi, compact ? 90 : 112, true, kUiFace);
+    app.fZoneHint = CreateFontFor(app.dpi, compact ? 90 : 105, true, kUiFace);
+    app.fUi = CreateFontFor(app.dpi, compact ? 82 : 95, false, kUiFace);
+    app.fUiBold = CreateFontFor(app.dpi, compact ? 82 : 95, true, kUiFace);
+    app.fButton = CreateFontFor(app.dpi, compact ? 82 : 95, true, kUiFace);
+    app.fSmall = CreateFontFor(app.dpi, compact ? 72 : 85, false, kUiFace);
+    app.fSmallBold = CreateFontFor(app.dpi, compact ? 68 : 80, true, kUiFace);
+    app.fMono = CreateFontFor(app.dpi, compact ? 88 : 100, false, kMonoFace);
+    app.fPanelHint = CreateFontFor(app.dpi, compact ? 105 : 125, true, kUiFace);
+}
+
+void DestroyAppFonts(App& app) {
+    auto dropFont = [](HFONT& font) {
+        if (font != nullptr) {
+            DeleteObject(font);
+            font = nullptr;
+        }
+    };
+    dropFont(app.fTitle);
+    dropFont(app.fZoneName);
+    dropFont(app.fZoneHint);
+    dropFont(app.fUi);
+    dropFont(app.fUiBold);
+    dropFont(app.fButton);
+    dropFont(app.fSmall);
+    dropFont(app.fSmallBold);
+    dropFont(app.fMono);
+    dropFont(app.fPanelHint);
+}
+
+void ApplyControlFonts(App& app) {
+    HWND buttons[] = {app.btnClear[0], app.btnClear[1], app.btnSwap, app.btnCompare,
+                      app.btnCopyBlock, app.btnCopyAll, app.btnExport};
+    for (HWND button : buttons) {
+        if (button != nullptr) {
+            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(app.fUiBold), TRUE);
+        }
+    }
+    if (app.tab != nullptr) {
+        SendMessageW(app.tab, WM_SETFONT, reinterpret_cast<WPARAM>(app.fUiBold), TRUE);
+    }
+    for (HWND edit : app.edits) {
+        if (edit != nullptr) {
+            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(app.fMono), TRUE);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 状态与提示
+
+void SetStatus(App& app, std::wstring text, COLORREF color = kText) {
+    app.status = std::move(text);
+    app.statusColor = color;
+    if (app.hwnd != nullptr) {
+        InvalidateRect(app.hwnd, &app.rcStatus, FALSE);
+    }
+}
+
+void ShowMessage(HWND owner, const std::wstring& text, UINT icon) {
+    MessageBoxW(owner, text.c_str(), L"MCLangDiff", MB_OK | icon | MB_SETFOREGROUND);
+}
+
+void DropFailed(App& app, const std::wstring& message) {
+    SetStatus(app, L"文件校验失败，请查看弹出的错误提示。", kRed);
+    ShowMessage(app.hwnd, message, MB_ICONERROR);
+}
+
+// 前向声明
+void UpdateTabLabels(App& app);
+void ShowActiveBlock(App& app);
+void ResetResult(App& app);
+void UpdateCompareEnabled(App& app);
+void PaintMain(HWND hwnd, const App& app);
+void PaintZone(const App& app, int index, HDC dc);
+void Layout(App& app);
+void OnZoneFile(App& app, int index, std::wstring path);
+void OnZoneClick(App& app, int index);
+void StartCompare(App& app);
+void ExportReport(App& app);
+
+// ---------------------------------------------------------------- 标签与结果
+
+void UpdateTabLabels(App& app) {
+    if (app.tab == nullptr) {
+        return;
+    }
+    size_t counts[3] = {0, 0, 0};
+    if (app.result != nullptr) {
+        counts[0] = app.result->added.size();
+        counts[1] = app.result->removed.size();
+        counts[2] = app.result->changed.size();
+    }
+    const wchar_t* names[3] = {L"A. 新增键", L"B. 删除键", L"C. 值变更"};
+    for (int i = 0; i < 3; ++i) {
+        wchar_t buffer[64] = {};
+        std::swprintf(buffer, 64, L"%ls (%zu)", names[i], counts[i]);
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = buffer;
+        TabCtrl_SetItem(app.tab, i, &item);
+    }
+}
+
+void ShowActiveBlock(App& app) {
+    for (int i = 0; i < 3; ++i) {
+        if (app.edits[i] == nullptr) {
+            continue;
+        }
+        const bool show = app.result != nullptr && i == app.activeTab;
+        ShowWindow(app.edits[i], show ? SW_SHOW : SW_HIDE);
+        if (show) {
+            SendMessageW(app.edits[i], EM_SETSEL, 0, 0);
+            SendMessageW(app.edits[i], EM_SCROLLCARET, 0, 0);
+        }
+    }
+    InvalidateRect(app.hwnd, &app.rcStats, FALSE);
+}
+
+void ResetResult(App& app) {
+    app.result.reset();
+    for (auto& text : app.statText) {
+        text.clear();
+    }
+    for (HWND edit : app.edits) {
+        if (edit != nullptr) {
+            SetWindowTextW(edit, L"");
+        }
+    }
+    UpdateTabLabels(app);
+    if (app.tab != nullptr) {
+        ShowWindow(app.tab, SW_HIDE);
+    }
+    for (HWND edit : app.edits) {
+        if (edit != nullptr) {
+            ShowWindow(edit, SW_HIDE);
+        }
+    }
+    EnableWindow(app.btnCopyBlock, FALSE);
+    EnableWindow(app.btnCopyAll, FALSE);
+    EnableWindow(app.btnExport, FALSE);
+    InvalidateRect(app.hwnd, nullptr, FALSE);
+}
+
+void UpdateCompareEnabled(App& app) {
+    const bool ready = app.zones[0].valid && app.zones[1].valid && !app.comparing;
+    if (app.btnCompare != nullptr) {
+        EnableWindow(app.btnCompare, ready);
+    }
+}
+
+void ApplyResult(App& app, std::unique_ptr<DiffResult> result) {
+    app.result = std::move(result);
+    app.statText[0] = mcd::Utf8ToWide(app.result->statsAdded);
+    app.statText[1] = mcd::Utf8ToWide(app.result->statsRemoved);
+    app.statText[2] = mcd::Utf8ToWide(app.result->statsChanged);
+
+    // Edit 控件只把 CRLF 识别为换行，因此在显示边界做一次转换。
+    SetWindowTextW(app.edits[0], mcd::ToCrlf(mcd::Utf8ToWide(app.result->blockAdded)).c_str());
+    SetWindowTextW(app.edits[1], mcd::ToCrlf(mcd::Utf8ToWide(app.result->blockRemoved)).c_str());
+    SetWindowTextW(app.edits[2], mcd::ToCrlf(mcd::Utf8ToWide(app.result->blockChanged)).c_str());
+
+    UpdateTabLabels(app);
+    ShowWindow(app.tab, SW_SHOW);
+    ShowActiveBlock(app);
+
+    EnableWindow(app.btnCopyBlock, TRUE);
+    EnableWindow(app.btnCopyAll, TRUE);
+    EnableWindow(app.btnExport, TRUE);
+    InvalidateRect(app.hwnd, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------- 布局
+
+void Layout(App& app) {
+    RECT client{};
+    GetClientRect(app.hwnd, &client);
+    const int width = client.right;
+    const int height = client.bottom;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    // 按逻辑像素（DIP）判断是否需要紧凑布局，兼容 200% 缩放的小屏幕。
+    const int dipWidth = MulDiv(width, 96, static_cast<int>(app.dpi));
+    const int dipHeight = MulDiv(height, 96, static_cast<int>(app.dpi));
+    const bool compact = dipWidth < 1000 || dipHeight < 640;
+    if (compact != app.compact) {
+        app.compact = compact;
+        DestroyAppFonts(app);
+        CreateAppFonts(app);
+        ApplyControlFonts(app);
+    }
+
+    const int margin = S(app, compact ? 12 : 24);
+    const int gap = S(app, compact ? 10 : 16);
+    app.rcHeader = {margin, S(app, compact ? 6 : 12), width - margin, S(app, compact ? 44 : 78)};
+
+    const int zoneTop = S(app, compact ? 48 : 84);
+    const int zoneHeight = S(app, compact ? 82 : 148);
+    const int zoneWidth = (width - 2 * margin - gap) / 2;
+    app.rcZones[0] = {margin, zoneTop, margin + zoneWidth, zoneTop + zoneHeight};
+    app.rcZones[1] = {margin + zoneWidth + gap, zoneTop, width - margin, zoneTop + zoneHeight};
+    MoveWindow(app.zoneHwnd[0], app.rcZones[0].left, app.rcZones[0].top, zoneWidth, zoneHeight, TRUE);
+    MoveWindow(app.zoneHwnd[1], app.rcZones[1].left, app.rcZones[1].top, zoneWidth, zoneHeight, TRUE);
+
+    const int buttonHeight = S(app, compact ? 28 : 38);
+    const int actionTop = zoneTop + zoneHeight + S(app, compact ? 8 : 16);
+    const int clearWidth = S(app, compact ? 88 : 112);
+    const int smallGap = S(app, compact ? 6 : 8);
+    const int swapWidth = S(app, compact ? 96 : 120);
+    const int compareWidth = S(app, compact ? 120 : 152);
+    int x = margin;
+    MoveWindow(app.btnClear[0], x, actionTop, clearWidth, buttonHeight, TRUE);
+    x += clearWidth + smallGap;
+    MoveWindow(app.btnClear[1], x, actionTop, clearWidth, buttonHeight, TRUE);
+    x += clearWidth + smallGap;
+    MoveWindow(app.btnSwap, x, actionTop, swapWidth, buttonHeight, TRUE);
+    MoveWindow(app.btnCompare, width - margin - compareWidth, actionTop, compareWidth, buttonHeight,
+               TRUE);
+
+    const int statusTop = actionTop + buttonHeight + S(app, compact ? 6 : 12);
+    const int statusHeight = S(app, compact ? 16 : 24);
+    app.rcStatus = {margin, statusTop, width - margin, statusTop + statusHeight};
+    const int progressWidth = S(app, compact ? 120 : 170);
+    app.rcProgress = {width - margin - progressWidth, statusTop + statusHeight / 2 - S(app, 3),
+                      width - margin, statusTop + statusHeight / 2 + S(app, 3)};
+    MoveWindow(app.progress, app.rcProgress.left, app.rcProgress.top,
+               app.rcProgress.right - app.rcProgress.left, app.rcProgress.bottom - app.rcProgress.top,
+               TRUE);
+
+    const int tabTop = statusTop + S(app, compact ? 22 : 32);
+    app.rcTab = {margin, tabTop, width - margin, tabTop + S(app, compact ? 24 : 32)};
+    MoveWindow(app.tab, app.rcTab.left, app.rcTab.top, app.rcTab.right - app.rcTab.left,
+               app.rcTab.bottom - app.rcTab.top, TRUE);
+
+    const int bottomHeight = S(app, compact ? 42 : 64);
+    app.rcBottom = {0, height - bottomHeight, width, height};
+    const int cardBottom = height - bottomHeight - S(app, compact ? 6 : 12);
+    app.rcCard = {margin, app.rcTab.bottom, width - margin, cardBottom};
+    app.rcStats = {app.rcCard.left, app.rcCard.top + 1, app.rcCard.right,
+                   app.rcCard.top + S(app, compact ? 26 : 38)};
+    const int editTop = app.rcStats.bottom + S(app, compact ? 4 : 6);
+    int editBottom = cardBottom - S(app, compact ? 8 : 12);
+    if (editBottom < editTop + S(app, 30)) {
+        editBottom = editTop + S(app, 30);
+    }
+    app.rcEdit = {app.rcCard.left + S(app, compact ? 8 : 12), editTop,
+                  app.rcCard.right - S(app, compact ? 8 : 12), editBottom};
+    for (HWND edit : app.edits) {
+        MoveWindow(edit, app.rcEdit.left, app.rcEdit.top, app.rcEdit.right - app.rcEdit.left,
+                   app.rcEdit.bottom - app.rcEdit.top, TRUE);
+        SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(S(app, compact ? 6 : 10), S(app, compact ? 6 : 10)));
+    }
+
+    const int barButtonHeight = S(app, compact ? 30 : 36);
+    const int barTop = app.rcBottom.top + (bottomHeight - barButtonHeight) / 2;
+    const int copyWidth = S(app, compact ? 88 : 120);
+    const int copyAllWidth = S(app, compact ? 104 : 140);
+    const int exportWidth = S(app, compact ? 88 : 120);
+    int bx = margin;
+    MoveWindow(app.btnCopyBlock, bx, barTop, copyWidth, barButtonHeight, TRUE);
+    bx += copyWidth + smallGap;
+    MoveWindow(app.btnCopyAll, bx, barTop, copyAllWidth, barButtonHeight, TRUE);
+    bx += copyAllWidth + smallGap;
+    MoveWindow(app.btnExport, bx, barTop, exportWidth, barButtonHeight, TRUE);
+    app.rcBottomHint = {width - margin - S(app, 280), barTop, width - margin,
+                        barTop + barButtonHeight};
+}
+
+// ---------------------------------------------------------------- 绘制
+
+void PaintHeader(HDC dc, const App& app) {
+    const int titleHeight = S(app, app.compact ? 24 : 34);
+    RECT title = {app.rcHeader.left, app.rcHeader.top, app.rcHeader.right,
+                  app.rcHeader.top + titleHeight};
+    DrawTextIn(dc, L"MCLangDiff", title, app.fTitle, kText,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT subtitle = {app.rcHeader.left, title.bottom, app.rcHeader.right, app.rcHeader.bottom};
+    DrawTextIn(dc, L"Minecraft 语言文件差异比较 · JSON / LANG · UTF-8", subtitle, app.fSmall,
+               kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    if (!app.compact) {
+        RECT version = {app.rcHeader.left, title.top, app.rcHeader.right, title.bottom};
+        DrawTextIn(dc, L"v1.0 · 单文件绿色版", version, app.fSmall, kMuted,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+void PaintZone(const App& app, int index, HDC dc) {
+    RECT rc{};
+    GetClientRect(app.zoneHwnd[index], &rc);
+    const ZoneState& zone = app.zones[index];
+    const COLORREF accent = index == 0 ? kOldAccent : kNewAccent;
+    const bool filled = zone.valid;
+    const bool hover = app.zoneHover[index];
+    const bool compact = app.compact;
+    const int pad = S(app, compact ? 10 : 16);
+
+    FillSolidRect(dc, rc, filled ? kPanel : Mix(kPanel, accent, 7));
+
+    if (filled) {
+        RECT stripe = {rc.left, rc.top, rc.left + S(app, 4), rc.bottom};
+        FillSolidRect(dc, stripe, accent);
+        RECT border = {rc.left, rc.top, rc.right, rc.bottom};
+        FrameRect1(dc, border, hover ? accent : kBorder);
+    } else {
+        const HPEN pen = CreatePen(PS_DASH, 1, hover ? accent : Mix(kPanel, accent, 45));
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, rc.left, rc.top, rc.right - 1, rc.bottom - 1);
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
+    }
+
+    RECT badge = {rc.left + pad, rc.top + pad, rc.left + pad + S(app, compact ? 38 : 46),
+                  rc.top + pad + S(app, compact ? 16 : 20)};
+    FillRoundRect(dc, badge, S(app, 4), accent, accent);
+    DrawTextIn(dc, index == 0 ? L"OLD" : L"NEW", badge, app.fSmallBold, RGB(255, 255, 255),
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    RECT title = {badge.right + S(app, compact ? 8 : 10), badge.top - S(app, 2), rc.right - pad,
+                  badge.bottom + S(app, 2)};
+    DrawTextIn(dc, index == 0 ? L"旧文件 / Old" : L"新文件 / New", title, app.fUiBold, kText,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    if (filled) {
+        const std::wstring format = FormatLabel(zone.format);
+        const int chipWidth = S(app, compact ? 42 : 52);
+        RECT chip = {rc.right - pad - chipWidth, badge.top, rc.right - pad, badge.bottom};
+        FillRoundRect(dc, chip, S(app, 10), Mix(kPanel, accent, 12), Mix(kPanel, accent, 30));
+        DrawTextIn(dc, format, chip, app.fSmallBold, accent,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        int y = badge.bottom + S(app, compact ? 4 : 12);
+        RECT nameRect = {rc.left + pad, y, rc.right - pad, y + S(app, compact ? 16 : 26)};
+        DrawTextIn(dc, zone.name, nameRect, app.fZoneName, kText,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        y = nameRect.bottom;
+        RECT pathRect = {rc.left + pad, y, rc.right - pad, y + S(app, compact ? 14 : 20)};
+        DrawTextIn(dc, zone.path, pathRect, app.fSmall, kMuted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+
+        y = pathRect.bottom + S(app, compact ? 0 : 4);
+        RECT infoRect = {rc.left + pad, y, rc.right - pad - (compact ? 0 : S(app, 72)),
+                         y + S(app, compact ? 14 : 20)};
+        const std::wstring info = L"大小 " + mcd::FormatSize(zone.bytes) + L" · 格式 " +
+                                  FormatLabel(zone.format) + L" · UTF-8";
+        DrawTextIn(dc, info, infoRect, app.fSmall, kMuted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        if (!compact) {
+            RECT readyRect = {rc.right - pad - S(app, 72), y, rc.right - pad, y + S(app, 20)};
+            DrawTextIn(dc, L"已就绪", readyRect, app.fSmallBold, accent,
+                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+    } else {
+        const int centerY = (badge.bottom + rc.bottom) / 2;
+        RECT line1 = {rc.left + pad, centerY - S(app, compact ? 18 : 24), rc.right - pad, centerY};
+        RECT line2 = {rc.left + pad, centerY + S(app, 2), rc.right - pad,
+                      centerY + S(app, compact ? 18 : 22)};
+        DrawTextIn(dc, L"拖入 .json 或 .lang 文件", line1, app.fZoneHint, hover ? accent : kText,
+                   DT_CENTER | DT_BOTTOM | DT_SINGLELINE);
+        DrawTextIn(dc, L"或点击此区域选择文件", line2, app.fSmall, kMuted,
+                   DT_CENTER | DT_TOP | DT_SINGLELINE);
+    }
+}
+
+void PaintResults(HDC dc, const App& app) {
+    if (app.result == nullptr) {
+        RECT card = {app.rcTab.left, app.rcTab.top, app.rcTab.right, app.rcCard.bottom};
+        FillSolidRect(dc, card, kPanel);
+        FrameRect1(dc, card, kBorder);
+
+        const int inset = S(app, app.compact ? 12 : 24);
+        const int centerY = card.top + (card.bottom - card.top) / 2;
+        RECT line1 = {card.left + inset, centerY - S(app, app.compact ? 26 : 48),
+                      card.right - inset, centerY + S(app, app.compact ? 2 : 6)};
+        RECT line2 = {card.left + inset, centerY + S(app, app.compact ? 6 : 12),
+                      card.right - inset, centerY + S(app, app.compact ? 24 : 36)};
+        DrawTextIn(dc, L"比较结果将在此显示", line1, app.fPanelHint, kText,
+                   DT_CENTER | DT_BOTTOM | DT_SINGLELINE);
+        DrawTextIn(dc, L"结果按 A 新增键 / B 删除键 / C 值变更 分块；每块先给出统计，再输出纯净条目。",
+                   line2, app.fSmall, kMuted, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        return;
+    }
+
+    FillSolidRect(dc, app.rcCard, kPanel);
+    FrameRect1(dc, app.rcCard, kBorder);
+
+    const RECT band = app.rcStats;
+    FillSolidRect(dc, band, RGB(249, 250, 251));
+    RECT divider = {band.left, band.bottom, band.right, band.bottom + 1};
+    FillSolidRect(dc, divider, kBorder);
+
+    const bool compact = app.compact;
+    const COLORREF accent = TabAccent(app.activeTab);
+    DrawDot(dc, band.left + S(app, compact ? 12 : 18), (band.top + band.bottom) / 2,
+            S(app, compact ? 3 : 4), accent);
+
+    RECT statsRect = {band.left + S(app, compact ? 22 : 32), band.top,
+                      band.right - S(app, compact ? 12 : 210), band.bottom};
+    DrawTextIn(dc, app.statText[app.activeTab], statsRect, app.fUiBold, kText,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    if (!compact) {
+        RECT hintRect = {band.right - S(app, 200), band.top, band.right - S(app, 16), band.bottom};
+        DrawTextIn(dc, L"纯条目区 · 可直接复制", hintRect, app.fSmall, kMuted,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+void PaintStatus(HDC dc, const App& app) {
+    RECT statusRect = app.rcStatus;
+    if (app.comparing) {
+        statusRect.right -= S(app, app.compact ? 130 : 190);
+    }
+    DrawTextIn(dc, app.status, statusRect, app.fUi, app.statusColor,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void PaintBottom(HDC dc, const App& app) {
+    RECT line = {app.rcBottom.left, app.rcBottom.top, app.rcBottom.right, app.rcBottom.top + 1};
+    FillSolidRect(dc, line, kBorder);
+    if (!app.compact) {
+        DrawTextIn(dc, L"条目顺序：按原文件出现顺序", app.rcBottomHint, app.fSmall, kMuted,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+void PaintMain(HWND hwnd, const App& app) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
+    HGDIOBJ oldBitmap = SelectObject(mem, bitmap);
+
+    FillSolidRect(mem, client, kBg);
+    PaintHeader(mem, app);
+    PaintStatus(mem, app);
+    PaintResults(mem, app);
+    PaintBottom(mem, app);
+
+    BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
+
+    SelectObject(mem, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(mem);
+    EndPaint(hwnd, &ps);
+}
+
+void DrawOwnerButton(const DRAWITEMSTRUCT& item, const App& app) {
+    const int id = static_cast<int>(item.CtlID);
+    const bool primary = id == kIdCompare;
+    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const auto hoverIt = app.buttonHover.find(item.hwndItem);
+    const bool hover = hoverIt != app.buttonHover.end() && hoverIt->second;
+
+    RECT rc = item.rcItem;
+    FillSolidRect(item.hDC, rc, kBg);
+
+    COLORREF background = kPanel;
+    COLORREF border = kBorder;
+    COLORREF foreground = kText;
+    if (primary) {
+        background = disabled ? kPrimaryDisabled : (pressed || hover ? kPrimaryHover : kPrimary);
+        border = background;
+        foreground = RGB(255, 255, 255);
+    } else if (disabled) {
+        background = RGB(243, 244, 246);
+        border = RGB(229, 231, 235);
+        foreground = RGB(156, 163, 175);
+    } else {
+        background = pressed ? RGB(238, 242, 247) : (hover ? RGB(249, 250, 251) : kPanel);
+        border = hover ? kPrimary : RGB(213, 219, 227);
+        foreground = RGB(31, 41, 55);
+    }
+
+    FillRoundRect(item.hDC, rc, S(app, 6), background, border);
+
+    wchar_t text[64] = {};
+    GetWindowTextW(item.hwndItem, text, 64);
+    RECT textRect = rc;
+    if (pressed) {
+        OffsetRect(&textRect, 0, 1);
+    }
+    DrawTextIn(item.hDC, text, textRect, app.fButton, foreground,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    if ((item.itemState & ODS_FOCUS) != 0 && !disabled) {
+        RECT focus = rc;
+        InflateRect(&focus, -S(app, 4), -S(app, 4));
+        DrawFocusRect(item.hDC, &focus);
+    }
+}
+
+// ---------------------------------------------------------------- 选择文件
+
+void OnZoneClick(App& app, int index) {
+    if (app.comparing) {
+        ShowMessage(app.hwnd, L"正在比较，请稍候再更换文件。", MB_ICONINFORMATION);
+        return;
+    }
+    wchar_t file[32768] = {};
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = app.hwnd;
+    dialog.lpstrFilter =
+        L"Minecraft 语言文件 (*.json;*.lang)\0*.json;*.lang\0JSON 文件 (*.json)\0*.json\0"
+        L"LANG 文件 (*.lang)\0*.lang\0所有文件 (*.*)\0*.*\0\0";
+    dialog.lpstrFile = file;
+    dialog.nMaxFile = 32768;
+    dialog.lpstrTitle = index == 0 ? L"选择旧文件 / Old" : L"选择新文件 / New";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&dialog) != FALSE) {
+        OnZoneFile(app, index, file);
+    }
+}
+
+void OnZoneFile(App& app, int index, std::wstring path) {
+    if (app.comparing) {
+        ShowMessage(app.hwnd, L"正在比较，请稍候再更换文件。", MB_ICONINFORMATION);
+        return;
+    }
+    if (path.size() >= 2 && path.front() == L'"' && path.back() == L'"') {
+        path = path.substr(1, path.size() - 2);
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) {
+        DropFailed(app, L"文件不存在或无法访问：\n" + path);
+        return;
+    }
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        DropFailed(app, L"这是文件夹，请拖入 .json 或 .lang 文件：\n" + path);
+        return;
+    }
+
+    const FileFormat format = mcd::FormatFromPath(path);
+    if (format == FileFormat::Unknown) {
+        DropFailed(app, L"格式不符：仅支持 .json 或 .lang 文件。\n" + path);
+        return;
+    }
+
+    const uint64_t size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    if (size == 0) {
+        DropFailed(app, L"文件为空（0 字节），无法参与比较：\n" + path);
+        return;
+    }
+    if (size > mcd::kMaxFileBytes) {
+        DropFailed(app, L"文件过大（超过 512 MB）：\n" + path);
+        return;
+    }
+
+    const int other = 1 - index;
+    if (app.zones[other].valid) {
+        if (app.zones[other].format != format) {
+            DropFailed(app, std::wstring(L"格式不一致：") + (other == 0 ? L"旧文件" : L"新文件") +
+                                 L"为 " + FormatLabel(app.zones[other].format) + L"，本次为 " +
+                                 FormatLabel(format) + L"。\n请选择相同格式的两个文件。");
+            return;
+        }
+        if (mcd::IsSameFile(path, app.zones[other].path)) {
+            DropFailed(app, L"新旧文件不能是同一个文件：\n" + path);
+            return;
+        }
+    }
+
+    ZoneState& zone = app.zones[index];
+    zone.path = path;
+    const size_t slash = path.find_last_of(L"\\/");
+    zone.name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    zone.format = format;
+    zone.bytes = size;
+    zone.valid = true;
+
+    InvalidateRect(app.zoneHwnd[index], nullptr, TRUE);
+    ResetResult(app);
+    UpdateCompareEnabled(app);
+
+    if (app.zones[0].valid && app.zones[1].valid) {
+        SetStatus(app, L"两个文件已就绪：点击“开始比较”。");
+    } else if (app.zones[0].valid) {
+        SetStatus(app, L"已选择旧文件，请继续选择新文件。");
+    } else {
+        SetStatus(app, L"已选择新文件，请继续选择旧文件。");
+    }
+}
+
+void ClearZone(App& app, int index) {
+    if (app.comparing) {
+        return;
+    }
+    app.zones[index] = ZoneState{};
+    InvalidateRect(app.zoneHwnd[index], nullptr, TRUE);
+    ResetResult(app);
+    UpdateCompareEnabled(app);
+    SetStatus(app, index == 0 ? L"已清空旧文件选择。" : L"已清空新文件选择。");
+}
+
+void SwapZones(App& app) {
+    if (app.comparing) {
+        return;
+    }
+    std::swap(app.zones[0], app.zones[1]);
+    InvalidateRect(app.zoneHwnd[0], nullptr, TRUE);
+    InvalidateRect(app.zoneHwnd[1], nullptr, TRUE);
+    ResetResult(app);
+    UpdateCompareEnabled(app);
+    SetStatus(app, L"已交换新旧文件，请重新比较。");
+}
+
+// ---------------------------------------------------------------- 比较
+
+void StartCompare(App& app) {
+    if (app.comparing) {
+        return;
+    }
+    if (!app.zones[0].valid || !app.zones[1].valid) {
+        ShowMessage(app.hwnd, L"请先选择旧文件和新文件。", MB_ICONINFORMATION);
+        return;
+    }
+    if (app.zones[0].format != app.zones[1].format) {
+        ShowMessage(app.hwnd, L"格式不一致：两个文件必须同为 .json 或同为 .lang。", MB_ICONERROR);
+        return;
+    }
+    if (mcd::IsSameFile(app.zones[0].path, app.zones[1].path)) {
+        ShowMessage(app.hwnd, L"新旧文件不能是同一个文件。", MB_ICONERROR);
+        return;
+    }
+
+    app.comparing = true;
+    SetStatus(app, L"正在比较…", kPrimary);
+    UpdateCompareEnabled(app);
+    EnableWindow(app.btnClear[0], FALSE);
+    EnableWindow(app.btnClear[1], FALSE);
+    EnableWindow(app.btnSwap, FALSE);
+    ShowWindow(app.progress, SW_SHOW);
+    SendMessageW(app.progress, PBM_SETMARQUEE, TRUE, 30);
+    InvalidateRect(app.hwnd, &app.rcStatus, FALSE);
+
+    const std::wstring oldPath = app.zones[0].path;
+    const std::wstring newPath = app.zones[1].path;
+    if (app.worker.joinable()) {
+        app.worker.join();
+    }
+    const HWND hwnd = app.hwnd;
+    app.worker = std::thread([hwnd, oldPath, newPath]() {
+        auto job = std::make_unique<CompareJob>();
+        job->ok = mcd::CompareFiles(oldPath, newPath, job->result, job->error);
+        if (IsWindow(hwnd)) {
+            PostMessageW(hwnd, kMsgCompareDone, 0, reinterpret_cast<LPARAM>(job.release()));
+        }
+    });
+}
+
+void OnCompareDone(App& app, std::unique_ptr<CompareJob> job) {
+    if (app.worker.joinable()) {
+        app.worker.join();
+    }
+    app.comparing = false;
+    EnableWindow(app.btnClear[0], TRUE);
+    EnableWindow(app.btnClear[1], TRUE);
+    EnableWindow(app.btnSwap, TRUE);
+    ShowWindow(app.progress, SW_HIDE);
+    SendMessageW(app.progress, PBM_SETMARQUEE, FALSE, 0);
+    UpdateCompareEnabled(app);
+
+    if (job == nullptr) {
+        SetStatus(app, L"比较失败：未收到有效结果。", kRed);
+        return;
+    }
+    if (!job->ok) {
+        SetStatus(app, L"比较失败，请查看弹出的错误提示。", kRed);
+        ShowMessage(app.hwnd, mcd::Utf8ToWide(job->error), MB_ICONERROR);
+        return;
+    }
+
+    DiffResult* raw = job->result.get();
+    ApplyResult(app, std::move(job->result));
+
+    wchar_t summary[256] = {};
+    std::swprintf(summary, 256, L"比较完成：新增 %zu · 删除 %zu · 值变更 %zu · 未变化 %zu · 耗时 %.0f ms",
+                  raw->added.size(), raw->removed.size(), raw->changed.size(), raw->unchanged,
+                  raw->elapsedMs);
+    SetStatus(app, summary);
+}
+
+// ---------------------------------------------------------------- 复制与导出
+
+bool CopyToClipboard(HWND owner, const std::wstring& text) {
+    if (!OpenClipboard(owner)) {
+        return false;
+    }
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (memory == nullptr) {
+        CloseClipboard();
+        return false;
+    }
+    void* destination = GlobalLock(memory);
+    if (destination == nullptr) {
+        GlobalFree(memory);
+        CloseClipboard();
+        return false;
+    }
+    std::memcpy(destination, text.c_str(), bytes);
+    GlobalUnlock(memory);
+    if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) {
+        GlobalFree(memory);
+        CloseClipboard();
+        return false;
+    }
+    CloseClipboard();
+    return true;
+}
+
+void CopyCurrentBlock(App& app) {
+    if (app.result == nullptr) {
+        ShowMessage(app.hwnd, L"暂无可复制的内容，请先进行比较。", MB_ICONINFORMATION);
+        return;
+    }
+    const std::string* block = &app.result->blockAdded;
+    if (app.activeTab == 1) {
+        block = &app.result->blockRemoved;
+    } else if (app.activeTab == 2) {
+        block = &app.result->blockChanged;
+    }
+    if (block->empty()) {
+        ShowMessage(app.hwnd, L"当前块为空，没有可复制的内容。", MB_ICONINFORMATION);
+        return;
+    }
+    if (!CopyToClipboard(app.hwnd, mcd::ToCrlf(mcd::Utf8ToWide(*block)))) {
+        ShowMessage(app.hwnd, L"复制到剪贴板失败。", MB_ICONERROR);
+        return;
+    }
+    SetStatus(app, L"已复制当前块的纯净条目到剪贴板。");
+}
+
+void CopyAllReport(App& app) {
+    if (app.result == nullptr) {
+        ShowMessage(app.hwnd, L"暂无可复制的内容，请先进行比较。", MB_ICONINFORMATION);
+        return;
+    }
+    if (!CopyToClipboard(app.hwnd, mcd::ToCrlf(mcd::Utf8ToWide(app.result->fullReport)))) {
+        ShowMessage(app.hwnd, L"复制到剪贴板失败。", MB_ICONERROR);
+        return;
+    }
+    SetStatus(app, L"已复制完整报告到剪贴板。");
+}
+
+std::wstring TimestampCompact() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local = {};
+    localtime_s(&local, &now);
+    wchar_t buffer[32] = {};
+    wcsftime(buffer, 32, L"%Y%m%d_%H%M%S", &local);
+    return buffer;
+}
+
+void ExportReport(App& app) {
+    if (app.result == nullptr) {
+        ShowMessage(app.hwnd, L"暂无可导出的报告，请先进行比较。", MB_ICONINFORMATION);
+        return;
+    }
+    wchar_t file[32768] = {};
+    const std::wstring defaultName = L"MCLangDiff_report_" + TimestampCompact() + L".txt";
+    lstrcpynW(file, defaultName.c_str(), 32768);
+
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = app.hwnd;
+    dialog.lpstrFilter = L"UTF-8 文本报告 (*.txt)\0*.txt\0所有文件 (*.*)\0*.*\0\0";
+    dialog.lpstrFile = file;
+    dialog.nMaxFile = 32768;
+    dialog.lpstrDefExt = L"txt";
+    dialog.lpstrTitle = L"导出差异报告";
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameW(&dialog) == FALSE) {
+        return;
+    }
+
+    std::string error;
+    const std::string report = mcd::ToCrlf(app.result->fullReport);
+    if (!mcd::WriteUtf8File(file, report, true, error)) {
+        ShowMessage(app.hwnd, mcd::Utf8ToWide(error), MB_ICONERROR);
+        return;
+    }
+    SetStatus(app, std::wstring(L"已导出报告：") + file);
+}
+
+// ---------------------------------------------------------------- 窗口过程
+
+LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                    UINT_PTR, DWORD_PTR) {
+    if (g_app != nullptr) {
+        if (message == WM_MOUSEMOVE) {
+            bool& hovered = g_app->buttonHover[hwnd];
+            if (!hovered) {
+                hovered = true;
+                TRACKMOUSEEVENT track{};
+                track.cbSize = sizeof(track);
+                track.dwFlags = TME_LEAVE;
+                track.hwndTrack = hwnd;
+                TrackMouseEvent(&track);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        } else if (message == WM_MOUSELEAVE) {
+            g_app->buttonHover[hwnd] = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+void HandleZoneDrop(ZoneContext* context, HDROP drop) {
+    if (context == nullptr || context->app == nullptr) {
+        DragFinish(drop);
+        return;
+    }
+    App& app = *context->app;
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    if (count != 1) {
+        DragFinish(drop);
+        DropFailed(app, L"一次只能拖入一个文件，请分别拖入旧文件与新文件。");
+        return;
+    }
+    const UINT length = DragQueryFileW(drop, 0, nullptr, 0);
+    std::wstring path(static_cast<size_t>(length) + 1, L'\0');
+    DragQueryFileW(drop, 0, path.data(), length + 1);
+    DragFinish(drop);
+    path.resize(length);
+    PostMessageW(GetParent(context->app->zoneHwnd[context->index]), kMsgZoneFile,
+                 static_cast<WPARAM>(context->index),
+                 reinterpret_cast<LPARAM>(new std::wstring(std::move(path))));
+}
+
+LRESULT CALLBACK ZoneWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* context = reinterpret_cast<ZoneContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (message) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (context != nullptr && context->app != nullptr) {
+                PaintZone(*context->app, context->index, dc);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_MOUSEMOVE:
+            if (context != nullptr && context->app != nullptr &&
+                !context->app->zoneHover[context->index]) {
+                context->app->zoneHover[context->index] = true;
+                TRACKMOUSEEVENT track{};
+                track.cbSize = sizeof(track);
+                track.dwFlags = TME_LEAVE;
+                track.hwndTrack = hwnd;
+                TrackMouseEvent(&track);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_MOUSELEAVE:
+            if (context != nullptr && context->app != nullptr) {
+                context->app->zoneHover[context->index] = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        case WM_LBUTTONUP:
+            if (context != nullptr && context->app != nullptr) {
+                OnZoneClick(*context->app, context->index);
+            }
+            return 0;
+        case WM_DROPFILES:
+            HandleZoneDrop(context, reinterpret_cast<HDROP>(wParam));
+            return 0;
+        case WM_NCDESTROY:
+            delete context;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+HWND CreateOwnerButton(HWND parent, int id, const wchar_t* text) {
+    HWND button = CreateWindowExW(0, L"BUTTON", text,
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10,
+                                  parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                  GetModuleHandleW(nullptr), nullptr);
+    if (button != nullptr) {
+        SetWindowSubclass(button, ButtonSubclassProc, 1, 0);
+    }
+    return button;
+}
+
+void BuildUi(App& app, HWND hwnd) {
+    app.hwnd = hwnd;
+    const UINT dpi = GetDpiForWindow(hwnd);
+    app.dpi = dpi == 0 ? 96 : dpi;
+    CreateAppFonts(app);
+    app.bgBrush = CreateSolidBrush(kBg);
+    app.panelBrush = CreateSolidBrush(kPanel);
+
+    const HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
+
+    for (int i = 0; i < 2; ++i) {
+        app.zoneHwnd[i] = CreateWindowExW(
+            0, kZoneClassName, L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(i == 0 ? kIdZoneOld : kIdZoneNew)),
+            instance, nullptr);
+        SetWindowLongPtrW(app.zoneHwnd[i], GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(new ZoneContext{&app, i}));
+        DragAcceptFiles(app.zoneHwnd[i], TRUE);
+    }
+
+    app.btnClear[0] = CreateOwnerButton(hwnd, kIdClearOld, L"清空旧文件");
+    app.btnClear[1] = CreateOwnerButton(hwnd, kIdClearNew, L"清空新文件");
+    app.btnSwap = CreateOwnerButton(hwnd, kIdSwap, L"交换新旧");
+    app.btnCompare = CreateOwnerButton(hwnd, kIdCompare, L"开始比较");
+    app.btnCopyBlock = CreateOwnerButton(hwnd, kIdCopyBlock, L"复制当前块");
+    app.btnCopyAll = CreateOwnerButton(hwnd, kIdCopyAll, L"复制全部报告");
+    app.btnExport = CreateOwnerButton(hwnd, kIdExport, L"导出报告");
+
+    app.tab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_TABSTOP | TCS_FOCUSNEVER, 0, 0,
+                              10, 10, hwnd,
+                              reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdTab)), instance,
+                              nullptr);
+    const wchar_t* titles[3] = {L"A. 新增键", L"B. 删除键", L"C. 值变更"};
+    TCITEMW item{};
+    item.mask = TCIF_TEXT;
+    for (int i = 0; i < 3; ++i) {
+        item.pszText = const_cast<wchar_t*>(titles[i]);
+        TabCtrl_InsertItem(app.tab, i, &item);
+    }
+
+    const DWORD editStyle = WS_CHILD | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+                            ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL;
+    const int editIds[3] = {kIdEditAdded, kIdEditRemoved, kIdEditChanged};
+    for (int i = 0; i < 3; ++i) {
+        app.edits[i] = CreateWindowExW(0, L"EDIT", L"", editStyle, 0, 0, 10, 10, hwnd,
+                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(editIds[i])),
+                                       instance, nullptr);
+    }
+
+    app.progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | PBS_MARQUEE, 0, 0, 10, 10,
+                                   hwnd,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdProgress)),
+                                   instance, nullptr);
+    SendMessageW(app.progress, PBM_SETMARQUEE, FALSE, 30);
+
+    ApplyControlFonts(app);
+
+    ShowWindow(app.tab, SW_HIDE);
+    for (HWND edit : app.edits) {
+        ShowWindow(edit, SW_HIDE);
+    }
+    ShowWindow(app.progress, SW_HIDE);
+
+    EnableWindow(app.btnCopyBlock, FALSE);
+    EnableWindow(app.btnCopyAll, FALSE);
+    EnableWindow(app.btnExport, FALSE);
+    EnableWindow(app.btnCompare, FALSE);
+
+    app.status = L"就绪：将旧文件与新文件分别拖入上方对应区域。";
+    DragAcceptFiles(hwnd, TRUE);
+
+    Layout(app);
+}
+
+void UpdateDpi(App& app, WPARAM wParam, LPARAM lParam) {
+    const UINT newDpi = LOWORD(wParam);
+    if (newDpi != 0) {
+        app.dpi = newDpi;
+    }
+    DestroyAppFonts(app);
+    CreateAppFonts(app);
+    ApplyControlFonts(app);
+
+    const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+    if (suggested != nullptr) {
+        SetWindowPos(app.hwnd, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left, suggested->bottom - suggested->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    Layout(app);
+    InvalidateRect(app.hwnd, nullptr, TRUE);
+    InvalidateRect(app.zoneHwnd[0], nullptr, TRUE);
+    InvalidateRect(app.zoneHwnd[1], nullptr, TRUE);
+}
+
+LRESULT CALLBACK MainWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    App* app = g_app;
+    switch (message) {
+        case WM_CREATE:
+            if (app != nullptr) {
+                BuildUi(*app, hwnd);
+            }
+            return 0;
+        case WM_SIZE:
+            if (app != nullptr && app->hwnd != nullptr) {
+                Layout(*app);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_PAINT:
+            if (app != nullptr) {
+                PaintMain(hwnd, *app);
+            }
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+            const UINT dpi = app != nullptr ? app->dpi : 96;
+            int minWidth = MulDiv(620, static_cast<int>(dpi), 96);
+            int minHeight = MulDiv(360, static_cast<int>(dpi), 96);
+            if (app != nullptr && app->workArea.right > app->workArea.left &&
+                app->workArea.bottom > app->workArea.top) {
+                const int workWidth = app->workArea.right - app->workArea.left;
+                const int workHeight = app->workArea.bottom - app->workArea.top;
+                minWidth = std::min(minWidth, workWidth - 16);
+                minHeight = std::min(minHeight, workHeight - 16);
+            }
+            info->ptMinTrackSize.x = std::max(minWidth, 320);
+            info->ptMinTrackSize.y = std::max(minHeight, 240);
+            return 0;
+        }
+        case WM_DPICHANGED:
+            if (app != nullptr) {
+                UpdateDpi(*app, wParam, lParam);
+            }
+            return 0;
+        case WM_COMMAND:
+            if (app != nullptr) {
+                switch (LOWORD(wParam)) {
+                    case kIdClearOld: ClearZone(*app, 0); return 0;
+                    case kIdClearNew: ClearZone(*app, 1); return 0;
+                    case kIdSwap: SwapZones(*app); return 0;
+                    case kIdCompare: StartCompare(*app); return 0;
+                    case kIdCopyBlock: CopyCurrentBlock(*app); return 0;
+                    case kIdCopyAll: CopyAllReport(*app); return 0;
+                    case kIdExport: ExportReport(*app); return 0;
+                    default: break;
+                }
+            }
+            break;
+        case WM_NOTIFY: {
+            auto* header = reinterpret_cast<NMHDR*>(lParam);
+            if (app != nullptr && header != nullptr && header->hwndFrom == app->tab &&
+                header->code == TCN_SELCHANGE) {
+                app->activeTab = TabCtrl_GetCurSel(app->tab);
+                ShowActiveBlock(*app);
+            }
+            return 0;
+        }
+        case WM_DRAWITEM: {
+            auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if (app != nullptr && item != nullptr && item->CtlType == ODT_BUTTON) {
+                DrawOwnerButton(*item, *app);
+                return TRUE;
+            }
+            break;
+        }
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT: {
+            if (app == nullptr) {
+                break;
+            }
+            const HWND child = reinterpret_cast<HWND>(lParam);
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            if (child == app->tab) {
+                SetBkColor(dc, kBg);
+                SetTextColor(dc, kText);
+                return reinterpret_cast<LRESULT>(app->bgBrush);
+            }
+            SetBkColor(dc, kPanel);
+            SetTextColor(dc, kText);
+            return reinterpret_cast<LRESULT>(app->panelBrush);
+        }
+        case WM_DROPFILES:
+            DragFinish(reinterpret_cast<HDROP>(wParam));
+            if (app != nullptr) {
+                ShowMessage(hwnd, L"请将文件拖入上方标注为“旧文件 / Old”或“新文件 / New”的区域。",
+                            MB_ICONINFORMATION);
+            }
+            return 0;
+        case kMsgZoneFile: {
+            std::unique_ptr<std::wstring> path(reinterpret_cast<std::wstring*>(lParam));
+            if (app != nullptr && path != nullptr) {
+                OnZoneFile(*app, static_cast<int>(wParam), std::move(*path));
+            }
+            return 0;
+        }
+        case kMsgZoneClick:
+            if (app != nullptr) {
+                OnZoneClick(*app, static_cast<int>(wParam));
+            }
+            return 0;
+        case kMsgCompareDone: {
+            std::unique_ptr<CompareJob> job(reinterpret_cast<CompareJob*>(lParam));
+            if (app != nullptr) {
+                OnCompareDone(*app, std::move(job));
+            }
+            return 0;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            if (app != nullptr && app->worker.joinable()) {
+                app->worker.detach();
+            }
+            PostQuitMessage(0);
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+}  // namespace
+
+int RunApp(HINSTANCE instance, int showCommand) {
+    INITCOMMONCONTROLSEX controls{};
+    controls.dwSize = sizeof(controls);
+    controls.dwICC = ICC_TAB_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&controls);
+
+    WNDCLASSEXW zoneClass{};
+    zoneClass.cbSize = sizeof(zoneClass);
+    zoneClass.style = CS_HREDRAW | CS_VREDRAW;
+    zoneClass.lpfnWndProc = ZoneWndProc;
+    zoneClass.hInstance = instance;
+    zoneClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    zoneClass.lpszClassName = kZoneClassName;
+    if (RegisterClassExW(&zoneClass) == 0) {
+        return 1;
+    }
+
+    WNDCLASSEXW mainClass{};
+    mainClass.cbSize = sizeof(mainClass);
+    mainClass.style = CS_HREDRAW | CS_VREDRAW;
+    mainClass.lpfnWndProc = MainWndProc;
+    mainClass.hInstance = instance;
+    mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    mainClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    mainClass.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
+    mainClass.lpszClassName = kMainClassName;
+    if (RegisterClassExW(&mainClass) == 0) {
+        return 1;
+    }
+
+    g_app = new App();
+    g_app->instance = instance;
+
+    const UINT systemDpi = GetDpiForSystem();
+    const int preferredWidth = MulDiv(1200, static_cast<int>(systemDpi), 96);
+    const int preferredHeight = MulDiv(880, static_cast<int>(systemDpi), 96);
+
+    RECT workArea{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    g_app->workArea = workArea;
+    const int availableWidth = workArea.right - workArea.left;
+    const int availableHeight = workArea.bottom - workArea.top;
+    const int workDipWidth = MulDiv(availableWidth, 96, static_cast<int>(systemDpi));
+    const int workDipHeight = MulDiv(availableHeight, 96, static_cast<int>(systemDpi));
+    const bool smallScreen = workDipWidth < 1100 || workDipHeight < 720;
+    const int outerWidth = std::min(preferredWidth, availableWidth - MulDiv(40, systemDpi, 96));
+    const int outerHeight = std::min(preferredHeight, availableHeight - MulDiv(40, systemDpi, 96));
+    const int x = workArea.left + (availableWidth - outerWidth) / 2;
+    const int y = workArea.top + (availableHeight - outerHeight) / 2;
+
+    const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+    HWND hwnd = CreateWindowExW(0, kMainClassName, L"MCLangDiff — Minecraft 语言文件差异比较",
+                                style, x, y, outerWidth, outerHeight, nullptr, nullptr, instance,
+                                nullptr);
+    if (hwnd == nullptr) {
+        delete g_app;
+        g_app = nullptr;
+        return 1;
+    }
+
+    ShowWindow(hwnd, smallScreen ? SW_MAXIMIZE : showCommand);
+    UpdateWindow(hwnd);
+
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+
+    delete g_app;
+    g_app = nullptr;
+    return static_cast<int>(message.wParam);
+}

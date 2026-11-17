@@ -1,0 +1,18 @@
+{
+  "item.demo.sword.name": "演示之剑",
+  "item.demo.pickaxe.name": "演示镐",
+  "item.demo.gem.name": "红宝石",
+  "block.demo.lamp.name": "红石灯",
+  "block.demo.ore.name": "深板岩矿石",
+  "gui.demo.title": "演示界面",
+  "gui.demo.close": "关闭",
+  "gui.demo.legacy": "旧版按钮",
+  "message.demo.welcome": "欢迎来到演示世界！",
+  "message.demo.farewell": "再见，旅行者。",
+  "tooltip.demo.tip": "提示：按 Shift 查看详情",
+  "item.demo.old_only.name": "仅存在于旧文件",
+  "item.demo.quoted.name": "带“引号”的名称",
+  "message.demo.quote": "他说：\"你好\"",
+  "item.demo.unicode.name": "\u4e2d\u6587",
+  "item.demo.emoji.name": "钻石 ⛏"
+}

@@ -1,0 +1,17 @@
+## 演示语言文件（新版）
+# 注释行不参与比较
+// 双斜杠注释同样会被忽略
+item.demo.sword.name=演示之剑
+item.demo.pickaxe.name=演示镐（强化）
+item.demo.gem.name=红宝石
+block.demo.lamp.name=红石灯
+block.demo.ore.name=深板岩矿石
+block.demo.new_block.name=新方块
+gui.demo.title=演示界面
+gui.demo.close=关闭界面
+gui.demo.settings=设置
+message.demo.welcome=欢迎来到演示世界！
+message.demo.farewell=再见，旅行者。
+tooltip.demo.tip=提示：按 Shift 查看详情
+item.demo.emoji.name=钻石 ⛏
+item.demo.new_only.name=仅存在于新文件
