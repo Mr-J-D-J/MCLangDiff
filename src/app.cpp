@@ -52,7 +52,10 @@ enum ControlId : int {
     kIdClearPaste = 1034,
     kIdCopyTemplate = 1035,
     kIdSyncFile = 1036,
-    kIdProgress = 1040
+    kIdCopySection = 1037,
+    kIdProgress = 1040,
+    kIdZoneSplitter = 1050,
+    kIdSyncSplitter = 1051
 };
 
 constexpr UINT kMsgZoneFile = WM_APP + 1;
@@ -61,6 +64,7 @@ constexpr UINT kMsgCompareDone = WM_APP + 3;
 
 const wchar_t kZoneClassName[] = L"MCLangDiff.DropZone";
 const wchar_t kMainClassName[] = L"MCLangDiff.Main";
+const wchar_t kSplitterClassName[] = L"MCLangDiff.Splitter";
 
 constexpr COLORREF kBg = RGB(245, 246, 248);
 constexpr COLORREF kPanel = RGB(255, 255, 255);
@@ -105,6 +109,12 @@ struct ZoneContext {
     int index = 0;
 };
 
+struct SplitterContext {
+    App* app = nullptr;
+    int kind = 0;  // 0 = 文件区高度，1 = 同步页两框分隔
+    bool dragging = false;
+};
+
 struct App {
     HINSTANCE instance = nullptr;
     HWND hwnd = nullptr;
@@ -126,6 +136,10 @@ struct App {
     HWND btnClearPaste = nullptr;
     HWND btnCopyTemplate = nullptr;
     HWND btnSyncFile = nullptr;
+    HWND btnCopySection = nullptr;
+    HWND tooltip = nullptr;
+    HWND zoneSplitter = nullptr;
+    HWND syncSplitter = nullptr;
 
     ZoneState zones[3];
     std::unique_ptr<DiffResult> result;
@@ -136,6 +150,9 @@ struct App {
     bool updateApplied = false;
     bool syncApplied = false;
     int activeTab = 0;
+    int hoveredTab = -1;
+    int zonesHeightOverride = -1;  // DIP；-1 表示按默认布局
+    double syncSplitFraction = 0.42;
 
     RECT workArea{};
     UINT dpi = 96;
@@ -180,6 +197,9 @@ struct App {
     RECT rcSyncPaste{};
     RECT rcSync{};
     RECT rcCopyTemplate{};
+    RECT rcSectionCopy{};
+    RECT rcZoneSplitter{};
+    RECT rcSyncSplitter{};
 
     ~App() {
         if (worker.joinable()) {
@@ -224,6 +244,16 @@ const ZoneUiInfo kZoneUi[3] = {
     {L"OLD", L"旧文件 / Old", L"en_us", L"拖入旧 en_us 文件", kOldAccent},
     {L"NEW", L"新文件 / New", L"en_us", L"拖入新 en_us 文件", kNewAccent},
     {L"ZH_CN", L"操作文件 / Target", L"zh_cn", L"拖入 zh_cn 操作文件", kTargetAccent},
+};
+
+const wchar_t* const kTabTips[5] = {
+    L"A. 新增键\n新 en_us 中存在、旧 en_us 中不存在的键。\n条目按新文件中的出现顺序排列。",
+    L"B. 删除键\n旧 en_us 中存在、新 en_us 中已移除的键。\n条目按旧文件中的出现顺序排列。",
+    L"C. 值变更\n新旧 en_us 都存在、但值不同的键。\n按新文件顺序列出旧条目与新条目原文。",
+    L"D. 更新 zh_cn\n把新增/值变更键的新翻译写入右侧选择的 zh_cn 操作文件，\n"
+    L"并删除旧 en_us 已移除的键。\n前提：操作文件键集合与旧 en_us 完全一致。",
+    L"E. 同步 zh_cn\n当操作文件缺少旧键或多出额外键时，\n"
+    L"先补齐缺失键的翻译并删除多余键，使其对齐旧 en_us。\n同步完成后再用 D 页更新到新版本。",
 };
 
 // ---------------------------------------------------------------- 绘制辅助
@@ -353,7 +383,8 @@ void DestroyAppFonts(App& app) {
 void ApplyControlFonts(App& app) {
     HWND buttons[] = {app.btnClear[0], app.btnClear[1], app.btnClear[2], app.btnSwap,
                       app.btnCompare,  app.btnCopyBlock, app.btnCopyAll, app.btnExport,
-                      app.btnUpdate,   app.btnClearPaste, app.btnCopyTemplate, app.btnSyncFile};
+                      app.btnUpdate,   app.btnClearPaste, app.btnCopyTemplate, app.btnSyncFile,
+                      app.btnCopySection};
     for (HWND button : buttons) {
         if (button != nullptr) {
             SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(app.fUiBold), TRUE);
@@ -386,6 +417,19 @@ void SetStatus(App& app, std::wstring text, COLORREF color = kText) {
     if (app.hwnd != nullptr) {
         InvalidateRect(app.hwnd, &app.rcStatus, FALSE);
     }
+}
+
+void AddTooltipTool(App& app, HWND control, const wchar_t* text) {
+    if (app.tooltip == nullptr || control == nullptr) {
+        return;
+    }
+    TOOLINFOW tool{};
+    tool.cbSize = sizeof(tool);
+    tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    tool.hwnd = app.hwnd;
+    tool.uId = reinterpret_cast<UINT_PTR>(control);
+    tool.lpszText = const_cast<wchar_t*>(text);
+    SendMessageW(app.tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
 }
 
 void ShowMessage(HWND owner, const std::wstring& text, UINT icon) {
@@ -589,6 +633,24 @@ void UpdateActionButtons(App& app) {
             app.syncTemplateEdit != nullptr && GetWindowTextLengthW(app.syncTemplateEdit) > 0;
         EnableWindow(app.btnCopyTemplate, onSyncTab && hasTemplate);
     }
+    if (app.btnCopySection != nullptr) {
+        const bool onDiffTab = app.result != nullptr && app.activeTab >= 0 && app.activeTab <= 2;
+        ShowWindow(app.btnCopySection, onDiffTab ? SW_SHOW : SW_HIDE);
+        bool hasBlock = false;
+        if (onDiffTab) {
+            if (app.activeTab == 0) {
+                hasBlock = !app.result->blockAdded.empty();
+            } else if (app.activeTab == 1) {
+                hasBlock = !app.result->blockRemoved.empty();
+            } else {
+                hasBlock = !app.result->blockChanged.empty();
+            }
+        }
+        EnableWindow(app.btnCopySection, onDiffTab && hasBlock);
+    }
+    if (app.syncSplitter != nullptr) {
+        ShowWindow(app.syncSplitter, onSyncTab ? SW_SHOW : SW_HIDE);
+    }
     LayoutBottomButtons(app);
 }
 
@@ -614,6 +676,9 @@ void ShowActiveBlock(App& app) {
     }
     if (app.syncPasteEdit != nullptr) {
         ShowWindow(app.syncPasteEdit, onSyncTab ? SW_SHOW : SW_HIDE);
+    }
+    if (app.syncSplitter != nullptr) {
+        ShowWindow(app.syncSplitter, onSyncTab ? SW_SHOW : SW_HIDE);
     }
     UpdateActionButtons(app);
     InvalidateRect(app.hwnd, nullptr, FALSE);
@@ -645,6 +710,12 @@ void ResetResult(App& app) {
     if (app.syncPasteEdit != nullptr) {
         SetWindowTextW(app.syncPasteEdit, L"");
         ShowWindow(app.syncPasteEdit, SW_HIDE);
+    }
+    if (app.syncSplitter != nullptr) {
+        ShowWindow(app.syncSplitter, SW_HIDE);
+    }
+    if (app.btnCopySection != nullptr) {
+        ShowWindow(app.btnCopySection, SW_HIDE);
     }
     UpdateTabLabels(app);
     if (app.tab != nullptr) {
@@ -736,7 +807,13 @@ void Layout(App& app) {
     app.rcHeader = {margin, S(app, compact ? 6 : 12), width - margin, S(app, compact ? 44 : 78)};
 
     const int zoneTop = S(app, compact ? 48 : 84);
-    const int zoneHeight = S(app, compact ? 82 : 148);
+    int zoneHeight = S(app, compact ? 82 : 148);
+    if (app.zonesHeightOverride > 0) {
+        const int minimum = compact ? 88 : 120;
+        app.zonesHeightOverride = std::max(minimum, std::min(240, app.zonesHeightOverride));
+        zoneHeight = S(app, app.zonesHeightOverride);
+    }
+    const int splitterHeight = S(app, compact ? 6 : 8);
     const int zoneWidth = (width - 2 * margin - 2 * gap) / 3;
     for (int i = 0; i < 3; ++i) {
         const int left = margin + i * (zoneWidth + gap);
@@ -744,9 +821,14 @@ void Layout(App& app) {
         app.rcZones[i] = {left, zoneTop, right, zoneTop + zoneHeight};
         MoveWindow(app.zoneHwnd[i], left, zoneTop, right - left, zoneHeight, TRUE);
     }
+    app.rcZoneSplitter = {margin, zoneTop + zoneHeight, width - margin,
+                          zoneTop + zoneHeight + splitterHeight};
+    MoveWindow(app.zoneSplitter, app.rcZoneSplitter.left, app.rcZoneSplitter.top,
+               app.rcZoneSplitter.right - app.rcZoneSplitter.left,
+               app.rcZoneSplitter.bottom - app.rcZoneSplitter.top, TRUE);
 
     const int buttonHeight = S(app, compact ? 28 : 38);
-    const int actionTop = zoneTop + zoneHeight + S(app, compact ? 8 : 16);
+    const int actionTop = app.rcZoneSplitter.bottom + S(app, compact ? 6 : 10);
     const int clearWidth = S(app, compact ? 88 : 112);
     const int clearTargetWidth = S(app, compact ? 96 : 124);
     const int smallGap = S(app, compact ? 6 : 8);
@@ -826,22 +908,25 @@ void Layout(App& app) {
     MoveWindow(app.btnCopyTemplate, app.rcCopyTemplate.left, app.rcCopyTemplate.top,
                app.rcCopyTemplate.right - app.rcCopyTemplate.left,
                app.rcCopyTemplate.bottom - app.rcCopyTemplate.top, TRUE);
+    app.rcSectionCopy = app.rcClearPaste;
+    MoveWindow(app.btnCopySection, app.rcSectionCopy.left, app.rcSectionCopy.top,
+               app.rcSectionCopy.right - app.rcSectionCopy.left,
+               app.rcSectionCopy.bottom - app.rcSectionCopy.top, TRUE);
 
-    const int syncContentTop = app.rcStats.bottom + S(app, compact ? 4 : 6);
+    const int syncContentTop = app.rcStats.bottom + S(app, compact ? 3 : 6);
     const int syncContentBottom = cardBottom - S(app, compact ? 8 : 12);
     const int syncCaptionHeight = S(app, compact ? 14 : 20);
-    const int syncGap = S(app, compact ? 4 : 8);
-    int syncUsable =
-        syncContentBottom - syncContentTop - syncCaptionHeight * 2 - syncGap;
-    if (syncUsable < S(app, 28)) {
-        syncUsable = S(app, 28);
+    const int syncGap = S(app, compact ? 3 : 6);
+    const int syncSplitHeight = S(app, compact ? 6 : 8);
+    int syncUsable = syncContentBottom - syncContentTop - syncCaptionHeight * 2 -
+                     syncGap * 2 - syncSplitHeight;
+    if (syncUsable < S(app, 60)) {
+        syncUsable = S(app, 60);
     }
-    int templateHeight = syncUsable * 42 / 100;
+    double fraction = std::max(0.18, std::min(0.82, app.syncSplitFraction));
+    int templateHeight = static_cast<int>(syncUsable * fraction);
+    templateHeight = std::max(S(app, 20), std::min(syncUsable - S(app, 20), templateHeight));
     int pasteHeight = syncUsable - templateHeight;
-    if (templateHeight < S(app, 20)) {
-        templateHeight = S(app, 20);
-        pasteHeight = syncUsable - templateHeight;
-    }
     if (pasteHeight < S(app, 20)) {
         pasteHeight = S(app, 20);
         templateHeight = syncUsable - pasteHeight;
@@ -850,17 +935,27 @@ void Layout(App& app) {
                                  syncContentTop + syncCaptionHeight};
     app.rcSyncTemplate = {app.rcEdit.left, app.rcSyncTemplateCaption.bottom, app.rcEdit.right,
                           app.rcSyncTemplateCaption.bottom + templateHeight};
-    app.rcSyncPasteCaption = {app.rcEdit.left, app.rcSyncTemplate.bottom + syncGap,
+    app.rcSyncSplitter = {app.rcEdit.left, app.rcSyncTemplate.bottom, app.rcEdit.right,
+                          app.rcSyncTemplate.bottom + syncSplitHeight};
+    app.rcSyncPasteCaption = {app.rcEdit.left, app.rcSyncSplitter.bottom + syncGap,
                               app.rcEdit.right,
-                              app.rcSyncTemplate.bottom + syncGap + syncCaptionHeight};
+                              app.rcSyncSplitter.bottom + syncGap + syncCaptionHeight};
     app.rcSyncPaste = {app.rcEdit.left, app.rcSyncPasteCaption.bottom, app.rcEdit.right,
                        syncContentBottom};
+    if (app.rcSyncPaste.bottom < app.rcSyncPaste.top + S(app, 20)) {
+        app.rcSyncPaste.bottom = app.rcSyncPaste.top + S(app, 20);
+    }
     if (app.syncTemplateEdit != nullptr) {
         MoveWindow(app.syncTemplateEdit, app.rcSyncTemplate.left, app.rcSyncTemplate.top,
                    app.rcSyncTemplate.right - app.rcSyncTemplate.left,
                    app.rcSyncTemplate.bottom - app.rcSyncTemplate.top, TRUE);
         SendMessageW(app.syncTemplateEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(S(app, compact ? 6 : 10), S(app, compact ? 6 : 10)));
+    }
+    if (app.syncSplitter != nullptr) {
+        MoveWindow(app.syncSplitter, app.rcSyncSplitter.left, app.rcSyncSplitter.top,
+                   app.rcSyncSplitter.right - app.rcSyncSplitter.left,
+                   app.rcSyncSplitter.bottom - app.rcSyncSplitter.top, TRUE);
     }
     if (app.syncPasteEdit != nullptr) {
         MoveWindow(app.syncPasteEdit, app.rcSyncPaste.left, app.rcSyncPaste.top,
@@ -906,7 +1001,14 @@ void PaintZone(const App& app, int index, HDC dc) {
     const bool filled = zone.valid;
     const bool hover = app.zoneHover[index];
     const bool compact = app.compact;
-    const int pad = S(app, compact ? 10 : 16);
+    const bool dense = compact || (rc.bottom - rc.top) < S(app, 140);
+    const int pad = S(app, compact ? 10 : (dense ? 12 : 16));
+    const int badgeHeight = S(app, compact ? 16 : (dense ? 18 : 20));
+    const int nameHeight = S(app, compact ? 16 : (dense ? 22 : 26));
+    const int pathHeight = S(app, compact ? 14 : (dense ? 18 : 20));
+    const int infoHeight = S(app, compact ? 14 : (dense ? 18 : 20));
+    const int gapName = S(app, compact ? 4 : (dense ? 8 : 12));
+    const int gapPath = S(app, compact ? 0 : (dense ? 2 : 4));
 
     FillSolidRect(dc, rc, filled ? kPanel : Mix(kPanel, accent, 7));
 
@@ -929,7 +1031,7 @@ void PaintZone(const App& app, int index, HDC dc) {
     const int badgeWidth =
         S(app, wideBadge ? (compact ? 46 : 56) : (compact ? 38 : 46));
     RECT badge = {rc.left + pad, rc.top + pad, rc.left + pad + badgeWidth,
-                  rc.top + pad + S(app, compact ? 16 : 20)};
+                  rc.top + pad + badgeHeight};
     FillRoundRect(dc, badge, S(app, 4), accent, accent);
     DrawTextIn(dc, ui.badge, badge, app.fSmallBold, RGB(255, 255, 255),
                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -947,34 +1049,35 @@ void PaintZone(const App& app, int index, HDC dc) {
         DrawTextIn(dc, format, chip, app.fSmallBold, accent,
                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        int y = badge.bottom + S(app, compact ? 4 : 12);
-        RECT nameRect = {rc.left + pad, y, rc.right - pad, y + S(app, compact ? 16 : 26)};
+        int y = badge.bottom + gapName;
+        RECT nameRect = {rc.left + pad, y, rc.right - pad, y + nameHeight};
         DrawTextIn(dc, zone.name, nameRect, app.fZoneName, kText,
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         y = nameRect.bottom;
-        RECT pathRect = {rc.left + pad, y, rc.right - pad, y + S(app, compact ? 14 : 20)};
+        RECT pathRect = {rc.left + pad, y, rc.right - pad, y + pathHeight};
         DrawTextIn(dc, zone.path, pathRect, app.fSmall, kMuted,
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
 
-        y = pathRect.bottom + S(app, compact ? 0 : 4);
+        y = pathRect.bottom + gapPath;
         RECT infoRect = {rc.left + pad, y, rc.right - pad - (compact ? 0 : S(app, 72)),
-                         y + S(app, compact ? 14 : 20)};
+                         y + infoHeight};
         const std::wstring info = std::wstring(ui.role) + L" · " + FormatLabel(zone.format) +
                                   L" · " + mcd::FormatSize(zone.bytes);
         DrawTextIn(dc, info, infoRect, app.fSmall, kMuted,
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         if (!compact) {
-            RECT readyRect = {rc.right - pad - S(app, 72), y, rc.right - pad, y + S(app, 20)};
+            RECT readyRect = {rc.right - pad - S(app, 72), y, rc.right - pad, y + infoHeight};
             DrawTextIn(dc, L"已就绪", readyRect, app.fSmallBold, accent,
                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
         }
     } else {
         const int centerY = (badge.bottom + rc.bottom) / 2;
-        RECT line1 = {rc.left + pad, centerY - S(app, compact ? 18 : 24), rc.right - pad, centerY};
+        const int hintOffset = S(app, (compact || dense) ? 18 : 24);
+        RECT line1 = {rc.left + pad, centerY - hintOffset, rc.right - pad, centerY};
         RECT line2 = {rc.left + pad, centerY + S(app, 2), rc.right - pad,
-                      centerY + S(app, compact ? 18 : 22)};
+                      centerY + S(app, (compact || dense) ? 18 : 22)};
         DrawTextIn(dc, ui.emptyHint, line1, app.fZoneHint, hover ? accent : kText,
                    DT_CENTER | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS);
         DrawTextIn(dc, L"或点击选择", line2, app.fSmall, kMuted,
@@ -1016,7 +1119,7 @@ void PaintResults(HDC dc, const App& app) {
     DrawDot(dc, band.left + S(app, compact ? 12 : 18), (band.top + band.bottom) / 2,
             S(app, compact ? 3 : 4), accent);
 
-    int statsRight = band.right - S(app, compact ? 12 : 210);
+    int statsRight = app.rcSectionCopy.left - S(app, 10);
     if (updateTab) {
         statsRight = app.rcUpdate.left - S(app, 10);
     } else if (syncTab) {
@@ -1027,12 +1130,6 @@ void PaintResults(HDC dc, const App& app) {
         updateTab ? app.dUpdateInfo : (syncTab ? app.syncInfo : app.statText[app.activeTab]);
     DrawTextIn(dc, statsText, statsRect, app.fUiBold, kText,
                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-    if (!compact && !updateTab && !syncTab) {
-        RECT hintRect = {band.right - S(app, 200), band.top, band.right - S(app, 16), band.bottom};
-        DrawTextIn(dc, L"纯条目区 · 可直接复制", hintRect, app.fSmall, kMuted,
-                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    }
 
     if (syncTab) {
         DrawTextIn(dc, compact ? L"模板（可复制）" : L"缺失条目模板（纯条目，可复制后翻译）",
@@ -1738,6 +1835,36 @@ LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
+LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                  UINT_PTR, DWORD_PTR) {
+    if (message == WM_KEYDOWN && (wParam == 'A' || wParam == 'a') &&
+        (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+        SendMessageW(hwnd, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                 UINT_PTR, DWORD_PTR) {
+    if (message == WM_MOUSEMOVE && g_app != nullptr && g_app->tooltip != nullptr) {
+        TCHITTESTINFO hit{};
+        hit.pt.x = static_cast<short>(LOWORD(lParam));
+        hit.pt.y = static_cast<short>(HIWORD(lParam));
+        const int index = TabCtrl_HitTest(hwnd, &hit);
+        if (index >= 0 && index < 5 && index != g_app->hoveredTab) {
+            g_app->hoveredTab = index;
+            TOOLINFOW tool{};
+            tool.cbSize = sizeof(tool);
+            tool.hwnd = g_app->hwnd;
+            tool.uId = reinterpret_cast<UINT_PTR>(hwnd);
+            tool.lpszText = const_cast<wchar_t*>(kTabTips[index]);
+            SendMessageW(g_app->tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+        }
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
 void HandleZoneDrop(ZoneContext* context, HDROP drop) {
     if (context == nullptr || context->app == nullptr) {
         DragFinish(drop);
@@ -1813,6 +1940,94 @@ LRESULT CALLBACK ZoneWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* context = reinterpret_cast<SplitterContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (message) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+            return TRUE;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            const bool insideCard = context != nullptr && context->kind == 1;
+            const App* app = context != nullptr ? context->app : nullptr;
+            FillSolidRect(dc, rc, insideCard ? kPanel : kBg);
+            const int midY = (rc.top + rc.bottom) / 2;
+            const int sidePad = app != nullptr ? S(*app, 8) : 8;
+            RECT line = {rc.left + sidePad, midY, rc.right - sidePad, midY + 1};
+            FillSolidRect(dc, line, kBorder);
+            const int centerX = (rc.left + rc.right) / 2;
+            const int dotGap = app != nullptr ? S(*app, 8) : 8;
+            const int dotH = app != nullptr ? S(*app, 3) : 3;
+            for (int i = -1; i <= 1; ++i) {
+                RECT grip = {centerX + i * dotGap, midY - dotH,
+                             centerX + i * dotGap + (app != nullptr ? S(*app, 2) : 2),
+                             midY + dotH + 1};
+                FillSolidRect(dc, grip, kMuted);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+            if (context != nullptr) {
+                context->dragging = true;
+                SetCapture(hwnd);
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            if (context != nullptr && context->dragging && GetCapture() == hwnd &&
+                context->app != nullptr) {
+                POINT point{};
+                GetCursorPos(&point);
+                ScreenToClient(context->app->hwnd, &point);
+                App& app = *context->app;
+                if (context->kind == 0) {
+                    const int heightPx = point.y - app.rcZones[0].top;
+                    int heightDip = MulDiv(heightPx, 96, static_cast<int>(app.dpi));
+                    const int minimum = app.compact ? 88 : 120;
+                    heightDip = std::max(minimum, std::min(240, heightDip));
+                    app.zonesHeightOverride = heightDip;
+                } else {
+                    const int top = app.rcSyncTemplateCaption.top;
+                    const int bottom = app.rcSyncPaste.bottom;
+                    if (bottom > top) {
+                        double fraction =
+                            static_cast<double>(point.y - top) / static_cast<double>(bottom - top);
+                        fraction = std::max(0.18, std::min(0.82, fraction));
+                        app.syncSplitFraction = fraction;
+                    }
+                }
+                Layout(app);
+                InvalidateRect(app.hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (context != nullptr) {
+                context->dragging = false;
+            }
+            if (GetCapture() == hwnd) {
+                ReleaseCapture();
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (context != nullptr) {
+                context->dragging = false;
+            }
+            return 0;
+        case WM_NCDESTROY:
+            delete context;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
 HWND CreateOwnerButton(HWND parent, int id, const wchar_t* text) {
     HWND button = CreateWindowExW(0, L"BUTTON", text,
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10,
@@ -1844,6 +2059,18 @@ void BuildUi(App& app, HWND hwnd) {
         DragAcceptFiles(app.zoneHwnd[i], TRUE);
     }
 
+    app.zoneSplitter = CreateWindowExW(0, kSplitterClassName, L"", WS_CHILD | WS_VISIBLE, 0, 0,
+                                       10, 10, hwnd,
+                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdZoneSplitter)),
+                                       instance, nullptr);
+    SetWindowLongPtrW(app.zoneSplitter, GWLP_USERDATA,
+                      reinterpret_cast<LONG_PTR>(new SplitterContext{&app, 0}));
+    app.syncSplitter = CreateWindowExW(0, kSplitterClassName, L"", WS_CHILD, 0, 0, 10, 10, hwnd,
+                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSyncSplitter)),
+                                       instance, nullptr);
+    SetWindowLongPtrW(app.syncSplitter, GWLP_USERDATA,
+                      reinterpret_cast<LONG_PTR>(new SplitterContext{&app, 1}));
+
     app.btnClear[0] = CreateOwnerButton(hwnd, kIdClearOld, L"清空旧文件");
     app.btnClear[1] = CreateOwnerButton(hwnd, kIdClearNew, L"清空新文件");
     app.btnClear[2] = CreateOwnerButton(hwnd, kIdClearTarget, L"清空操作文件");
@@ -1856,6 +2083,7 @@ void BuildUi(App& app, HWND hwnd) {
     app.btnClearPaste = CreateOwnerButton(hwnd, kIdClearPaste, L"清空粘贴");
     app.btnCopyTemplate = CreateOwnerButton(hwnd, kIdCopyTemplate, L"复制模板");
     app.btnSyncFile = CreateOwnerButton(hwnd, kIdSyncFile, L"同步文件");
+    app.btnCopySection = CreateOwnerButton(hwnd, kIdCopySection, L"复制本块");
 
     app.tab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_TABSTOP | TCS_FOCUSNEVER, 0, 0,
                               10, 10, hwnd,
@@ -1906,7 +2134,46 @@ void BuildUi(App& app, HWND hwnd) {
                                    instance, nullptr);
     SendMessageW(app.progress, PBM_SETMARQUEE, FALSE, 30);
 
+    app.tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                  WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hwnd, nullptr,
+                                  instance, nullptr);
+    if (app.tooltip != nullptr) {
+        SendMessageW(app.tooltip, TTM_SETMAXTIPWIDTH, 0, S(app, 480));
+        SendMessageW(app.tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+    }
+
     ApplyControlFonts(app);
+
+    AddTooltipTool(app, app.btnClear[0], L"清空旧文件 / Old (en_us) 区域的选择。");
+    AddTooltipTool(app, app.btnClear[1], L"清空新文件 / New (en_us) 区域的选择。");
+    AddTooltipTool(app, app.btnClear[2], L"清空 zh_cn 操作文件区域的选择。");
+    AddTooltipTool(app, app.btnSwap, L"交换旧文件与新文件区域。");
+    AddTooltipTool(app, app.btnCompare, L"比较旧/新 en_us，生成 A/B/C 差异报告。");
+    AddTooltipTool(app, app.btnCopySection, L"复制当前 A/B/C 页的纯净条目区。");
+    AddTooltipTool(app, app.btnCopyBlock, L"复制当前 A/B/C 页的纯净条目区。");
+    AddTooltipTool(app, app.btnCopyAll, L"复制完整报告（含统计与 A/B/C 区块）。");
+    AddTooltipTool(app, app.btnExport, L"导出完整报告为 UTF-8 TXT（带 BOM）。");
+    AddTooltipTool(app, app.btnUpdate,
+                   L"写入右侧 zh_cn 操作文件：新增/变更翻译 + 删除旧键。\n"
+                   L"需要操作文件键集合与旧 en_us 完全一致。");
+    AddTooltipTool(app, app.btnClearPaste, L"清空 D 页的粘贴框。");
+    AddTooltipTool(app, app.btnCopyTemplate,
+                   L"复制 E 页缺失条目模板（纯净条目，可粘贴后翻译）。");
+    AddTooltipTool(app, app.btnSyncFile,
+                   L"把缺失键的翻译写入 zh_cn，并删除多余键，使其对齐旧 en_us。");
+    AddTooltipTool(app, app.zoneSplitter, L"上下拖动调整文件区高度，为结果区腾出更多空间。");
+    AddTooltipTool(app, app.syncSplitter, L"上下拖动调整模板与粘贴框的高度。");
+    AddTooltipTool(app, app.tab, kTabTips[0]);
+    SetWindowSubclass(app.tab, TabSubclassProc, 1, 0);
+    for (HWND edit : app.edits) {
+        if (edit != nullptr) {
+            SetWindowSubclass(edit, EditSubclassProc, 3, 0);
+        }
+    }
+    SetWindowSubclass(app.pasteEdit, EditSubclassProc, 3, 0);
+    SetWindowSubclass(app.syncTemplateEdit, EditSubclassProc, 3, 0);
+    SetWindowSubclass(app.syncPasteEdit, EditSubclassProc, 3, 0);
 
     ShowWindow(app.tab, SW_HIDE);
     for (HWND edit : app.edits) {
@@ -1919,6 +2186,8 @@ void BuildUi(App& app, HWND hwnd) {
     ShowWindow(app.btnClearPaste, SW_HIDE);
     ShowWindow(app.btnCopyTemplate, SW_HIDE);
     ShowWindow(app.btnSyncFile, SW_HIDE);
+    ShowWindow(app.btnCopySection, SW_HIDE);
+    ShowWindow(app.syncSplitter, SW_HIDE);
     ShowWindow(app.progress, SW_HIDE);
 
     EnableWindow(app.btnCopyBlock, FALSE);
@@ -1929,6 +2198,7 @@ void BuildUi(App& app, HWND hwnd) {
     EnableWindow(app.btnClearPaste, FALSE);
     EnableWindow(app.btnCopyTemplate, FALSE);
     EnableWindow(app.btnSyncFile, FALSE);
+    EnableWindow(app.btnCopySection, FALSE);
 
     app.status = L"就绪：拖入旧/新 en_us 与 zh_cn 操作文件，然后比较。";
     DragAcceptFiles(hwnd, TRUE);
@@ -2027,6 +2297,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                     case kIdClearPaste: ClearPasteBox(*app); return 0;
                     case kIdCopyTemplate: CopySyncTemplate(*app); return 0;
                     case kIdSyncFile: OnSyncFile(*app); return 0;
+                    case kIdCopySection: CopyCurrentBlock(*app); return 0;
                     default: break;
                 }
             }
@@ -2124,6 +2395,17 @@ int RunApp(HINSTANCE instance, int showCommand) {
     zoneClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     zoneClass.lpszClassName = kZoneClassName;
     if (RegisterClassExW(&zoneClass) == 0) {
+        return 1;
+    }
+
+    WNDCLASSEXW splitterClass{};
+    splitterClass.cbSize = sizeof(splitterClass);
+    splitterClass.style = CS_HREDRAW | CS_VREDRAW;
+    splitterClass.lpfnWndProc = SplitterWndProc;
+    splitterClass.hInstance = instance;
+    splitterClass.hCursor = LoadCursorW(nullptr, IDC_SIZENS);
+    splitterClass.lpszClassName = kSplitterClassName;
+    if (RegisterClassExW(&splitterClass) == 0) {
         return 1;
     }
 
