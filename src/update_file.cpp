@@ -290,7 +290,7 @@ struct JsonNode {
     std::string_view raw;
 };
 
-bool BuildJsonContent(const LangFile& target, const DiffResult& diff,
+bool BuildJsonContent(const LangFile& target, const LangFile& orderFile,
                       const std::unordered_map<std::string_view, const PastedEntry*>& pasted,
                       const std::unordered_set<std::string_view>& removedKeys,
                       const std::unordered_map<std::string_view, uint32_t>& newIndex,
@@ -325,8 +325,8 @@ bool BuildJsonContent(const LangFile& target, const DiffResult& diff,
         synthesizedLead = newline + "  ";
     }
 
-    for (uint32_t i = 0; i < diff.newFile->entries.size(); ++i) {
-        const std::string_view key = diff.newFile->entries[i].key;
+    for (uint32_t i = 0; i < orderFile.entries.size(); ++i) {
+        const std::string_view key = orderFile.entries[i].key;
         const auto pastedIt = pasted.find(key);
         if (pastedIt == pasted.end()) {
             continue;
@@ -408,7 +408,7 @@ struct LangLine {
     std::string key;
 };
 
-bool BuildLangContent(const LangFile& target, const DiffResult& diff,
+bool BuildLangContent(const LangFile& target, const LangFile& orderFile,
                       const std::unordered_map<std::string_view, const PastedEntry*>& pasted,
                       const std::unordered_set<std::string_view>& removedKeys,
                       const std::unordered_map<std::string_view, uint32_t>& newIndex,
@@ -485,8 +485,8 @@ bool BuildLangContent(const LangFile& target, const DiffResult& diff,
         }
     }
 
-    for (uint32_t i = 0; i < diff.newFile->entries.size(); ++i) {
-        const std::string_view key = diff.newFile->entries[i].key;
+    for (uint32_t i = 0; i < orderFile.entries.size(); ++i) {
+        const std::string_view key = orderFile.entries[i].key;
         const auto pastedIt = pasted.find(key);
         if (pastedIt == pasted.end()) {
             continue;
@@ -559,6 +559,119 @@ bool WriteUpdatedTarget(const std::wstring& targetPath, FileFormat format, std::
     return true;
 }
 
+bool ValidatePastedCoverage(const std::vector<std::string_view>& requiredKeys,
+                            const PastedBlock& pasted,
+                            std::unordered_map<std::string_view, const PastedEntry*>& pastedMap,
+                            std::string& err) {
+    pastedMap.clear();
+    pastedMap.reserve(pasted.entries.size() * 2 + 1);
+    std::unordered_set<std::string_view> requiredSet(requiredKeys.begin(), requiredKeys.end());
+    std::vector<std::string> problems;
+
+    for (const PastedEntry& entry : pasted.entries) {
+        if (requiredSet.find(entry.key) == requiredSet.end()) {
+            problems.push_back("第 " + std::to_string(entry.line) + " 行：键 \"" + entry.key +
+                               "\" 不属于本次需要粘贴的键");
+            continue;
+        }
+        const auto inserted = pastedMap.emplace(entry.key, &entry);
+        if (!inserted.second) {
+            problems.push_back("第 " + std::to_string(entry.line) + " 行：键 \"" + entry.key +
+                               "\" 重复（首次出现于第 " +
+                               std::to_string(inserted.first->second->line) + " 行）");
+        }
+    }
+
+    std::vector<std::string_view> missing;
+    for (const std::string_view key : requiredKeys) {
+        if (pastedMap.find(key) == pastedMap.end()) {
+            missing.push_back(key);
+        }
+    }
+    if (!missing.empty()) {
+        std::string line = "缺少 " + std::to_string(missing.size()) + " 个键：";
+        const size_t shown = std::min<size_t>(missing.size(), 10);
+        for (size_t i = 0; i < shown; ++i) {
+            if (i != 0) {
+                line += "、";
+            }
+            line += std::string(missing[i]);
+        }
+        if (missing.size() > shown) {
+            line += " 等";
+        }
+        problems.push_back(std::move(line));
+    }
+
+    if (!problems.empty()) {
+        std::string message = "粘贴内容校验失败，未修改操作文件；请修正以下问题：\n\n";
+        const size_t shown = std::min(problems.size(), kMaxReportedProblems);
+        for (size_t i = 0; i < shown; ++i) {
+            message += "- ";
+            message += problems[i];
+            message += "\n";
+        }
+        if (problems.size() > shown) {
+            message += "- ……共 " + std::to_string(problems.size()) + " 个问题，仅显示前 " +
+                       std::to_string(shown) + " 个\n";
+        }
+        message +=
+            "\n提示：只粘贴要求的新翻译条目，不要粘贴无关或重复的键；LANG 文件使用 key=value 行。";
+        err = message;
+        return false;
+    }
+    return true;
+}
+
+struct KeyDiff {
+    std::vector<std::string_view> missing;
+    std::vector<std::string_view> extra;
+};
+
+void ComputeKeyDiff(const LangFile& target, const LangFile& reference, KeyDiff& diff) {
+    diff.missing.clear();
+    diff.extra.clear();
+    for (const Entry& entry : reference.entries) {
+        if (target.index.find(entry.key) == target.index.end()) {
+            diff.missing.push_back(entry.key);
+        }
+    }
+    for (const Entry& entry : target.entries) {
+        if (reference.index.find(entry.key) == reference.index.end()) {
+            diff.extra.push_back(entry.key);
+        }
+    }
+}
+
+std::string JoinKeys(const std::vector<std::string_view>& keys, size_t maxCount) {
+    std::string text;
+    const size_t shown = std::min(keys.size(), maxCount);
+    for (size_t i = 0; i < shown; ++i) {
+        if (i != 0) {
+            text += "、";
+        }
+        text += std::string(keys[i]);
+    }
+    if (keys.size() > shown) {
+        text += " 等";
+    }
+    return text;
+}
+
+std::string BuildConsistencyMessage(const KeyDiff& diff) {
+    std::string message = "操作文件与旧 en_us 的键集合不一致，未修改文件。\n\n";
+    if (!diff.missing.empty()) {
+        message += "缺少 " + std::to_string(diff.missing.size()) +
+                   " 个键：" + JoinKeys(diff.missing, 12) + "\n";
+    }
+    if (!diff.extra.empty()) {
+        message += "多出 " + std::to_string(diff.extra.size()) +
+                   " 个键：" + JoinKeys(diff.extra, 12) + "\n";
+    }
+    message += "\n请先在 E 页将操作文件同步到旧 en_us，再回到 D 页更新到新版本。";
+    return message;
+}
+
 }  // namespace
 
 std::vector<std::string_view> CollectRequiredKeys(const DiffResult& diff) {
@@ -605,6 +718,135 @@ bool ParsePastedBlock(std::string_view text, FileFormat format, PastedBlock& out
     return false;
 }
 
+bool CheckTargetConsistency(const std::wstring& targetPath, const DiffResult& diff,
+                            ConsistencyReport& report) {
+    report = ConsistencyReport{};
+    if (diff.oldFile == nullptr || diff.newFile == nullptr) {
+        report.state = TargetConsistency::Error;
+        report.error = "比较结果缺少源文件数据，请重新比较。";
+        return false;
+    }
+
+    auto target = std::make_unique<LangFile>();
+    std::string loadError;
+    if (!LoadLangFile(targetPath, diff.format, *target, loadError)) {
+        report.state = TargetConsistency::Error;
+        report.error = "操作文件：" + loadError;
+        return false;
+    }
+
+    KeyDiff vsOld;
+    ComputeKeyDiff(*target, *diff.oldFile, vsOld);
+    report.missing.reserve(vsOld.missing.size());
+    for (const std::string_view key : vsOld.missing) {
+        report.missing.emplace_back(key);
+    }
+    report.extra.reserve(vsOld.extra.size());
+    for (const std::string_view key : vsOld.extra) {
+        report.extra.emplace_back(key);
+    }
+
+    if (report.missing.empty() && report.extra.empty()) {
+        report.state = TargetConsistency::MatchesOld;
+        return true;
+    }
+
+    KeyDiff vsNew;
+    ComputeKeyDiff(*target, *diff.newFile, vsNew);
+    report.state = (vsNew.missing.empty() && vsNew.extra.empty())
+                       ? TargetConsistency::MatchesNew
+                       : TargetConsistency::Mismatch;
+    return true;
+}
+
+bool BuildMissingEntriesTemplate(const DiffResult& diff, const ConsistencyReport& report,
+                                 std::string& text) {
+    text.clear();
+    if (diff.oldFile == nullptr) {
+        return false;
+    }
+    bool first = true;
+    for (const std::string& key : report.missing) {
+        const auto found = diff.oldFile->index.find(key);
+        if (found == diff.oldFile->index.end()) {
+            continue;
+        }
+        const Entry& entry = diff.oldFile->entries[found->second];
+        if (diff.format == FileFormat::Json) {
+            if (!first) {
+                text.append(",\n");
+            }
+            text.append(entry.indent);
+            text.append(entry.raw);
+        } else {
+            if (!first) {
+                text.push_back('\n');
+            }
+            text.append(entry.raw);
+        }
+        first = false;
+    }
+    return true;
+}
+
+bool ApplyTargetSync(const std::wstring& targetPath, const DiffResult& diff,
+                     const PastedBlock& pasted, UpdateStats& stats, std::string& err) {
+    stats = UpdateStats{};
+    if (diff.oldFile == nullptr || diff.newFile == nullptr) {
+        err = "比较结果缺少源文件数据，请重新比较。";
+        return false;
+    }
+    if (IsSameFile(targetPath, Utf8ToWide(diff.oldPath)) ||
+        IsSameFile(targetPath, Utf8ToWide(diff.newPath))) {
+        err = "操作文件不能与旧/新 en_us 文件相同。";
+        return false;
+    }
+
+    auto target = std::make_unique<LangFile>();
+    if (!LoadLangFile(targetPath, diff.format, *target, err)) {
+        err = "操作文件：" + err;
+        return false;
+    }
+
+    KeyDiff diffKeys;
+    ComputeKeyDiff(*target, *diff.oldFile, diffKeys);
+    if (diffKeys.missing.empty() && diffKeys.extra.empty()) {
+        err = "操作文件与旧 en_us 的键已一致，无需同步。";
+        return false;
+    }
+
+    const std::vector<std::string_view> required(diffKeys.missing.begin(), diffKeys.missing.end());
+    std::unordered_map<std::string_view, const PastedEntry*> pastedMap;
+    if (!ValidatePastedCoverage(required, pasted, pastedMap, err)) {
+        return false;
+    }
+
+    std::unordered_set<std::string_view> removedKeys(diffKeys.extra.begin(), diffKeys.extra.end());
+    std::unordered_map<std::string_view, uint32_t> oldIndex;
+    oldIndex.reserve(diff.oldFile->entries.size() * 2 + 1);
+    for (uint32_t i = 0; i < diff.oldFile->entries.size(); ++i) {
+        oldIndex.emplace(diff.oldFile->entries[i].key, i);
+    }
+
+    std::string content;
+    if (diff.format == FileFormat::Json) {
+        if (!BuildJsonContent(*target, *diff.oldFile, pastedMap, removedKeys, oldIndex, stats, content)) {
+            err = "生成同步后的 JSON 内容失败。";
+            return false;
+        }
+    } else {
+        if (!BuildLangContent(*target, *diff.oldFile, pastedMap, removedKeys, oldIndex, stats,
+                              content, err)) {
+            return false;
+        }
+    }
+
+    if (!WriteUpdatedTarget(targetPath, diff.format, content, err)) {
+        return false;
+    }
+    return true;
+}
+
 bool ApplyTranslationUpdate(const std::wstring& targetPath, const DiffResult& diff,
                             const PastedBlock& pasted, UpdateStats& stats, std::string& err) {
     stats = UpdateStats{};
@@ -624,8 +866,18 @@ bool ApplyTranslationUpdate(const std::wstring& targetPath, const DiffResult& di
         return false;
     }
 
+    KeyDiff vsOld;
+    ComputeKeyDiff(*target, *diff.oldFile, vsOld);
+    if (!vsOld.missing.empty() || !vsOld.extra.empty()) {
+        err = BuildConsistencyMessage(vsOld);
+        return false;
+    }
+
     const std::vector<std::string_view> requiredKeys = CollectRequiredKeys(diff);
-    std::unordered_set<std::string_view> requiredSet(requiredKeys.begin(), requiredKeys.end());
+    std::unordered_map<std::string_view, const PastedEntry*> pastedMap;
+    if (!ValidatePastedCoverage(requiredKeys, pasted, pastedMap, err)) {
+        return false;
+    }
 
     std::unordered_map<std::string_view, uint32_t> newIndex;
     newIndex.reserve(diff.newFile->entries.size() * 2 + 1);
@@ -641,64 +893,6 @@ bool ApplyTranslationUpdate(const std::wstring& targetPath, const DiffResult& di
         }
     }
 
-    std::unordered_map<std::string_view, const PastedEntry*> pastedMap;
-    pastedMap.reserve(pasted.entries.size() * 2 + 1);
-    std::vector<std::string> problems;
-
-    for (const PastedEntry& entry : pasted.entries) {
-        if (requiredSet.find(entry.key) == requiredSet.end()) {
-            problems.push_back("第 " + std::to_string(entry.line) + " 行：键 \"" + entry.key +
-                               "\" 不在新增/值变更集合中");
-            continue;
-        }
-        const auto inserted = pastedMap.emplace(entry.key, &entry);
-        if (!inserted.second) {
-            problems.push_back("第 " + std::to_string(entry.line) + " 行：键 \"" + entry.key +
-                               "\" 重复（首次出现于第 " +
-                               std::to_string(inserted.first->second->line) + " 行）");
-        }
-    }
-
-    std::vector<std::string_view> missing;
-    for (const std::string_view key : requiredKeys) {
-        if (pastedMap.find(key) == pastedMap.end()) {
-            missing.push_back(key);
-        }
-    }
-    if (!missing.empty()) {
-        std::string line = "缺少 " + std::to_string(missing.size()) + " 个键：";
-        const size_t shown = std::min<size_t>(missing.size(), 10);
-        for (size_t i = 0; i < shown; ++i) {
-            if (i != 0) {
-                line += "、";
-            }
-            line += std::string(missing[i]);
-        }
-        if (missing.size() > shown) {
-            line += " 等";
-        }
-        problems.push_back(std::move(line));
-    }
-
-    if (!problems.empty()) {
-        std::string message = "粘贴内容校验失败，未修改操作文件；请修正以下问题：\n\n";
-        const size_t shown = std::min(problems.size(), kMaxReportedProblems);
-        for (size_t i = 0; i < shown; ++i) {
-            message += "- ";
-            message += problems[i];
-            message += "\n";
-        }
-        if (problems.size() > shown) {
-            message += "- ……共 " + std::to_string(problems.size()) + " 个问题，仅显示前 " +
-                       std::to_string(shown) + " 个\n";
-        }
-        message +=
-            "\n提示：只粘贴新增键与值变更键的新翻译条目，不要粘贴“旧 / Old”部分；"
-            "LANG 文件使用 key=value 行。";
-        err = message;
-        return false;
-    }
-
     if (requiredKeys.empty() && removedKeys.empty()) {
         err = "当前比较结果没有新增、值变更或删除条目，无需更新操作文件。";
         return false;
@@ -706,12 +900,14 @@ bool ApplyTranslationUpdate(const std::wstring& targetPath, const DiffResult& di
 
     std::string content;
     if (diff.format == FileFormat::Json) {
-        if (!BuildJsonContent(*target, diff, pastedMap, removedKeys, newIndex, stats, content)) {
+        if (!BuildJsonContent(*target, *diff.newFile, pastedMap, removedKeys, newIndex, stats,
+                              content)) {
             err = "生成更新后的 JSON 内容失败。";
             return false;
         }
     } else {
-        if (!BuildLangContent(*target, diff, pastedMap, removedKeys, newIndex, stats, content, err)) {
+        if (!BuildLangContent(*target, *diff.newFile, pastedMap, removedKeys, newIndex, stats,
+                              content, err)) {
             return false;
         }
     }

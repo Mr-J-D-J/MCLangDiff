@@ -3,8 +3,8 @@
 1 24 "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -17,11 +17,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "MCLangDiff"
             VALUE "FileDescription", "Minecraft Language File Diff"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", "1.1.0.0"
             VALUE "InternalName", "MCLangDiff"
             VALUE "OriginalFilename", "MCLangDiff.exe"
             VALUE "ProductName", "MCLangDiff"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", "1.1.0.0"
         END
     END
     BLOCK "VarFileInfo"

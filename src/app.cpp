@@ -43,11 +43,15 @@ enum ControlId : int {
     kIdEditRemoved = 1022,
     kIdEditChanged = 1023,
     kIdPasteEdit = 1024,
+    kIdSyncTemplateEdit = 1025,
+    kIdSyncPasteEdit = 1026,
     kIdCopyBlock = 1030,
     kIdCopyAll = 1031,
     kIdExport = 1032,
     kIdUpdateFile = 1033,
     kIdClearPaste = 1034,
+    kIdCopyTemplate = 1035,
+    kIdSyncFile = 1036,
     kIdProgress = 1040
 };
 
@@ -112,19 +116,25 @@ struct App {
     HWND tab = nullptr;
     HWND edits[3] = {};
     HWND pasteEdit = nullptr;
+    HWND syncTemplateEdit = nullptr;
+    HWND syncPasteEdit = nullptr;
     HWND progress = nullptr;
     HWND btnCopyBlock = nullptr;
     HWND btnCopyAll = nullptr;
     HWND btnExport = nullptr;
     HWND btnUpdate = nullptr;
     HWND btnClearPaste = nullptr;
+    HWND btnCopyTemplate = nullptr;
+    HWND btnSyncFile = nullptr;
 
     ZoneState zones[3];
     std::unique_ptr<DiffResult> result;
+    mcd::ConsistencyReport consistency;
     std::thread worker;
     bool comparing = false;
     bool compact = false;
     bool updateApplied = false;
+    bool syncApplied = false;
     int activeTab = 0;
 
     RECT workArea{};
@@ -145,6 +155,7 @@ struct App {
 
     std::wstring statText[3];
     std::wstring dUpdateInfo;
+    std::wstring syncInfo;
     std::wstring status;
     COLORREF statusColor = kText;
 
@@ -163,6 +174,12 @@ struct App {
     RECT rcBottomHint{};
     RECT rcUpdate{};
     RECT rcClearPaste{};
+    RECT rcSyncTemplateCaption{};
+    RECT rcSyncTemplate{};
+    RECT rcSyncPasteCaption{};
+    RECT rcSyncPaste{};
+    RECT rcSync{};
+    RECT rcCopyTemplate{};
 
     ~App() {
         if (worker.joinable()) {
@@ -336,7 +353,7 @@ void DestroyAppFonts(App& app) {
 void ApplyControlFonts(App& app) {
     HWND buttons[] = {app.btnClear[0], app.btnClear[1], app.btnClear[2], app.btnSwap,
                       app.btnCompare,  app.btnCopyBlock, app.btnCopyAll, app.btnExport,
-                      app.btnUpdate,   app.btnClearPaste};
+                      app.btnUpdate,   app.btnClearPaste, app.btnCopyTemplate, app.btnSyncFile};
     for (HWND button : buttons) {
         if (button != nullptr) {
             SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(app.fUiBold), TRUE);
@@ -352,6 +369,12 @@ void ApplyControlFonts(App& app) {
     }
     if (app.pasteEdit != nullptr) {
         SendMessageW(app.pasteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(app.fMono), TRUE);
+    }
+    if (app.syncTemplateEdit != nullptr) {
+        SendMessageW(app.syncTemplateEdit, WM_SETFONT, reinterpret_cast<WPARAM>(app.fMono), TRUE);
+    }
+    if (app.syncPasteEdit != nullptr) {
+        SendMessageW(app.syncPasteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(app.fMono), TRUE);
     }
 }
 
@@ -377,6 +400,8 @@ void DropFailed(App& app, const std::wstring& message) {
 // 前向声明
 void UpdateTabLabels(App& app);
 void UpdateUpdateInfo(App& app);
+void UpdateSyncInfo(App& app);
+void RefreshTargetConsistency(App& app);
 void UpdateActionButtons(App& app);
 void LayoutBottomButtons(App& app);
 void ShowActiveBlock(App& app);
@@ -390,7 +415,9 @@ void OnZoneClick(App& app, int index);
 void StartCompare(App& app);
 void ExportReport(App& app);
 void OnUpdateFile(App& app);
+void OnSyncFile(App& app);
 void ClearPasteBox(App& app);
+void CopySyncTemplate(App& app);
 
 // ---------------------------------------------------------------- 标签与结果
 
@@ -422,6 +449,11 @@ void UpdateTabLabels(App& app) {
     updateItem.mask = TCIF_TEXT;
     updateItem.pszText = const_cast<wchar_t*>(app.compact ? L"D. 更新" : L"D. 更新 zh_cn");
     TabCtrl_SetItem(app.tab, 3, &updateItem);
+
+    TCITEMW syncItem{};
+    syncItem.mask = TCIF_TEXT;
+    syncItem.pszText = const_cast<wchar_t*>(app.compact ? L"E. 同步" : L"E. 同步 zh_cn");
+    TabCtrl_SetItem(app.tab, 4, &syncItem);
 }
 
 void UpdateUpdateInfo(App& app) {
@@ -432,27 +464,85 @@ void UpdateUpdateInfo(App& app) {
     if (app.result == nullptr) {
         return;
     }
-    const size_t added = app.result->added.size();
-    const size_t changed = app.result->changed.size();
-    const size_t required = added + changed;
-    const size_t removed = app.result->removed.size();
     if (!app.zones[2].valid) {
         app.dUpdateInfo = L"更新 · 请先选择 zh_cn 操作文件";
-    } else if (required == 0 && removed == 0) {
-        app.dUpdateInfo = L"更新 · 当前报告没有需要更新的条目";
+    } else if (app.consistency.state == mcd::TargetConsistency::Error) {
+        app.dUpdateInfo = L"更新 · 操作文件读取失败，点击可查看详情";
+    } else if (app.consistency.state == mcd::TargetConsistency::MatchesNew) {
+        app.dUpdateInfo = L"更新 · 操作文件已与新 en_us 一致，无需更新";
+    } else if (app.consistency.state == mcd::TargetConsistency::Mismatch) {
+        app.dUpdateInfo = L"更新 · 与旧 en_us 不一致（缺 " +
+                          std::to_wstring(app.consistency.missing.size()) + L" / 多 " +
+                          std::to_wstring(app.consistency.extra.size()) +
+                          L"）· 请先到 E 页同步";
     } else {
-        app.dUpdateInfo = L"更新 · 需粘贴 " + std::to_wstring(required) + L" 条（新增 " +
-                          std::to_wstring(added) + L" / 变更 " + std::to_wstring(changed) +
-                          L"）· 删除 " + std::to_wstring(removed) + L" 条";
+        const size_t added = app.result->added.size();
+        const size_t changed = app.result->changed.size();
+        const size_t required = added + changed;
+        const size_t removed = app.result->removed.size();
+        if (required == 0 && removed == 0) {
+            app.dUpdateInfo = L"更新 · 当前报告没有需要更新的条目";
+        } else {
+            app.dUpdateInfo = L"更新 · 需粘贴 " + std::to_wstring(required) + L" 条（新增 " +
+                              std::to_wstring(added) + L" / 变更 " + std::to_wstring(changed) +
+                              L"）· 删除 " + std::to_wstring(removed) + L" 条";
+        }
     }
     InvalidateRect(app.hwnd, &app.rcStats, FALSE);
+}
+
+void UpdateSyncInfo(App& app) {
+    if (app.syncApplied) {
+        return;
+    }
+    app.syncInfo.clear();
+    if (app.result == nullptr) {
+        return;
+    }
+    if (!app.zones[2].valid) {
+        app.syncInfo = L"同步 · 请先选择 zh_cn 操作文件";
+    } else if (app.consistency.state == mcd::TargetConsistency::Error) {
+        app.syncInfo = L"同步 · 操作文件读取失败，点击同步可查看详情";
+    } else if (app.consistency.state == mcd::TargetConsistency::MatchesOld) {
+        app.syncInfo = L"同步 · 键已与旧 en_us 一致，无需同步";
+    } else if (app.consistency.state == mcd::TargetConsistency::MatchesNew) {
+        app.syncInfo = L"同步 · 键已与新 en_us 一致，无需同步";
+    } else if (app.consistency.state == mcd::TargetConsistency::Mismatch) {
+        app.syncInfo = L"同步 · 缺 " + std::to_wstring(app.consistency.missing.size()) +
+                       L" 个键 / 多 " + std::to_wstring(app.consistency.extra.size()) +
+                       L" 个键 · 粘贴翻译后同步";
+    } else {
+        app.syncInfo = L"同步 · 请先完成 en_us 比较";
+    }
+    InvalidateRect(app.hwnd, &app.rcStats, FALSE);
+}
+
+void RefreshTargetConsistency(App& app) {
+    app.consistency = mcd::ConsistencyReport{};
+    std::string templateText;
+    if (app.result != nullptr && app.zones[2].valid) {
+        if (mcd::CheckTargetConsistency(app.zones[2].path, *app.result, app.consistency) &&
+            app.consistency.state == mcd::TargetConsistency::Mismatch) {
+            mcd::BuildMissingEntriesTemplate(*app.result, app.consistency, templateText);
+        }
+    }
+    if (app.syncTemplateEdit != nullptr) {
+        const std::wstring wide = mcd::ToCrlf(mcd::Utf8ToWide(templateText));
+        SetWindowTextW(app.syncTemplateEdit, wide.c_str());
+    }
+    UpdateUpdateInfo(app);
+    UpdateSyncInfo(app);
+    UpdateActionButtons(app);
+    if (app.syncTemplateEdit != nullptr) {
+        InvalidateRect(app.syncTemplateEdit, nullptr, TRUE);
+    }
 }
 
 void LayoutBottomButtons(App& app) {
     if (app.btnCopyBlock == nullptr || app.btnCopyAll == nullptr || app.btnExport == nullptr) {
         return;
     }
-    const bool onUpdateTab = app.result != nullptr && app.activeTab == 3;
+    const bool onUpdateTab = app.result != nullptr && (app.activeTab == 3 || app.activeTab == 4);
     ShowWindow(app.btnCopyBlock, onUpdateTab ? SW_HIDE : SW_SHOW);
     ShowWindow(app.btnCopyAll, SW_SHOW);
     ShowWindow(app.btnExport, SW_SHOW);
@@ -477,6 +567,7 @@ void LayoutBottomButtons(App& app) {
 
 void UpdateActionButtons(App& app) {
     const bool onUpdateTab = app.result != nullptr && app.activeTab == 3;
+    const bool onSyncTab = app.result != nullptr && app.activeTab == 4;
     if (app.btnUpdate != nullptr) {
         ShowWindow(app.btnUpdate, onUpdateTab ? SW_SHOW : SW_HIDE);
         EnableWindow(app.btnUpdate, onUpdateTab && !app.updateApplied);
@@ -485,11 +576,25 @@ void UpdateActionButtons(App& app) {
         ShowWindow(app.btnClearPaste, onUpdateTab ? SW_SHOW : SW_HIDE);
         EnableWindow(app.btnClearPaste, onUpdateTab);
     }
+    if (app.btnSyncFile != nullptr) {
+        ShowWindow(app.btnSyncFile, onSyncTab ? SW_SHOW : SW_HIDE);
+        const bool canSync = onSyncTab && !app.syncApplied &&
+                             (app.consistency.state == mcd::TargetConsistency::Mismatch ||
+                              app.consistency.state == mcd::TargetConsistency::Error);
+        EnableWindow(app.btnSyncFile, canSync);
+    }
+    if (app.btnCopyTemplate != nullptr) {
+        ShowWindow(app.btnCopyTemplate, onSyncTab ? SW_SHOW : SW_HIDE);
+        const bool hasTemplate =
+            app.syncTemplateEdit != nullptr && GetWindowTextLengthW(app.syncTemplateEdit) > 0;
+        EnableWindow(app.btnCopyTemplate, onSyncTab && hasTemplate);
+    }
     LayoutBottomButtons(app);
 }
 
 void ShowActiveBlock(App& app) {
     const bool onUpdateTab = app.result != nullptr && app.activeTab == 3;
+    const bool onSyncTab = app.result != nullptr && app.activeTab == 4;
     for (int i = 0; i < 3; ++i) {
         if (app.edits[i] == nullptr) {
             continue;
@@ -504,14 +609,23 @@ void ShowActiveBlock(App& app) {
     if (app.pasteEdit != nullptr) {
         ShowWindow(app.pasteEdit, onUpdateTab ? SW_SHOW : SW_HIDE);
     }
+    if (app.syncTemplateEdit != nullptr) {
+        ShowWindow(app.syncTemplateEdit, onSyncTab ? SW_SHOW : SW_HIDE);
+    }
+    if (app.syncPasteEdit != nullptr) {
+        ShowWindow(app.syncPasteEdit, onSyncTab ? SW_SHOW : SW_HIDE);
+    }
     UpdateActionButtons(app);
-    InvalidateRect(app.hwnd, &app.rcStats, FALSE);
+    InvalidateRect(app.hwnd, nullptr, FALSE);
 }
 
 void ResetResult(App& app) {
     app.result.reset();
     app.updateApplied = false;
+    app.syncApplied = false;
+    app.consistency = mcd::ConsistencyReport{};
     app.dUpdateInfo.clear();
+    app.syncInfo.clear();
     for (auto& text : app.statText) {
         text.clear();
     }
@@ -523,6 +637,14 @@ void ResetResult(App& app) {
     if (app.pasteEdit != nullptr) {
         SetWindowTextW(app.pasteEdit, L"");
         ShowWindow(app.pasteEdit, SW_HIDE);
+    }
+    if (app.syncTemplateEdit != nullptr) {
+        SetWindowTextW(app.syncTemplateEdit, L"");
+        ShowWindow(app.syncTemplateEdit, SW_HIDE);
+    }
+    if (app.syncPasteEdit != nullptr) {
+        SetWindowTextW(app.syncPasteEdit, L"");
+        ShowWindow(app.syncPasteEdit, SW_HIDE);
     }
     UpdateTabLabels(app);
     if (app.tab != nullptr) {
@@ -561,6 +683,14 @@ void ApplyResult(App& app, std::unique_ptr<DiffResult> result) {
     if (app.pasteEdit != nullptr) {
         SetWindowTextW(app.pasteEdit, L"");
     }
+    if (app.syncPasteEdit != nullptr) {
+        SetWindowTextW(app.syncPasteEdit, L"");
+    }
+    if (app.syncTemplateEdit != nullptr) {
+        SetWindowTextW(app.syncTemplateEdit, L"");
+    }
+    app.syncApplied = false;
+    app.syncInfo.clear();
 
     app.activeTab = 0;
     UpdateTabLabels(app);
@@ -568,7 +698,7 @@ void ApplyResult(App& app, std::unique_ptr<DiffResult> result) {
         TabCtrl_SetCurSel(app.tab, 0);
         ShowWindow(app.tab, SW_SHOW);
     }
-    UpdateUpdateInfo(app);
+    RefreshTargetConsistency(app);
     ShowActiveBlock(app);
 
     EnableWindow(app.btnCopyBlock, TRUE);
@@ -689,6 +819,56 @@ void Layout(App& app) {
     MoveWindow(app.btnClearPaste, app.rcClearPaste.left, app.rcClearPaste.top,
                app.rcClearPaste.right - app.rcClearPaste.left,
                app.rcClearPaste.bottom - app.rcClearPaste.top, TRUE);
+    app.rcSync = app.rcUpdate;
+    app.rcCopyTemplate = app.rcClearPaste;
+    MoveWindow(app.btnSyncFile, app.rcSync.left, app.rcSync.top,
+               app.rcSync.right - app.rcSync.left, app.rcSync.bottom - app.rcSync.top, TRUE);
+    MoveWindow(app.btnCopyTemplate, app.rcCopyTemplate.left, app.rcCopyTemplate.top,
+               app.rcCopyTemplate.right - app.rcCopyTemplate.left,
+               app.rcCopyTemplate.bottom - app.rcCopyTemplate.top, TRUE);
+
+    const int syncContentTop = app.rcStats.bottom + S(app, compact ? 4 : 6);
+    const int syncContentBottom = cardBottom - S(app, compact ? 8 : 12);
+    const int syncCaptionHeight = S(app, compact ? 14 : 20);
+    const int syncGap = S(app, compact ? 4 : 8);
+    int syncUsable =
+        syncContentBottom - syncContentTop - syncCaptionHeight * 2 - syncGap;
+    if (syncUsable < S(app, 28)) {
+        syncUsable = S(app, 28);
+    }
+    int templateHeight = syncUsable * 42 / 100;
+    int pasteHeight = syncUsable - templateHeight;
+    if (templateHeight < S(app, 20)) {
+        templateHeight = S(app, 20);
+        pasteHeight = syncUsable - templateHeight;
+    }
+    if (pasteHeight < S(app, 20)) {
+        pasteHeight = S(app, 20);
+        templateHeight = syncUsable - pasteHeight;
+    }
+    app.rcSyncTemplateCaption = {app.rcEdit.left, syncContentTop, app.rcEdit.right,
+                                 syncContentTop + syncCaptionHeight};
+    app.rcSyncTemplate = {app.rcEdit.left, app.rcSyncTemplateCaption.bottom, app.rcEdit.right,
+                          app.rcSyncTemplateCaption.bottom + templateHeight};
+    app.rcSyncPasteCaption = {app.rcEdit.left, app.rcSyncTemplate.bottom + syncGap,
+                              app.rcEdit.right,
+                              app.rcSyncTemplate.bottom + syncGap + syncCaptionHeight};
+    app.rcSyncPaste = {app.rcEdit.left, app.rcSyncPasteCaption.bottom, app.rcEdit.right,
+                       syncContentBottom};
+    if (app.syncTemplateEdit != nullptr) {
+        MoveWindow(app.syncTemplateEdit, app.rcSyncTemplate.left, app.rcSyncTemplate.top,
+                   app.rcSyncTemplate.right - app.rcSyncTemplate.left,
+                   app.rcSyncTemplate.bottom - app.rcSyncTemplate.top, TRUE);
+        SendMessageW(app.syncTemplateEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(S(app, compact ? 6 : 10), S(app, compact ? 6 : 10)));
+    }
+    if (app.syncPasteEdit != nullptr) {
+        MoveWindow(app.syncPasteEdit, app.rcSyncPaste.left, app.rcSyncPaste.top,
+                   app.rcSyncPaste.right - app.rcSyncPaste.left,
+                   app.rcSyncPaste.bottom - app.rcSyncPaste.top, TRUE);
+        SendMessageW(app.syncPasteEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(S(app, compact ? 6 : 10), S(app, compact ? 6 : 10)));
+    }
 
     const int barButtonHeight = S(app, compact ? 30 : 36);
     const int barTop = app.rcBottom.top + (bottomHeight - barButtonHeight) / 2;
@@ -712,7 +892,7 @@ void PaintHeader(HDC dc, const App& app) {
 
     if (!app.compact) {
         RECT version = {app.rcHeader.left, title.top, app.rcHeader.right, title.bottom};
-        DrawTextIn(dc, L"v1.0 · 单文件绿色版", version, app.fSmall, kMuted,
+        DrawTextIn(dc, L"v1.1 · 单文件绿色版", version, app.fSmall, kMuted,
                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 }
@@ -816,7 +996,7 @@ void PaintResults(HDC dc, const App& app) {
                       card.right - inset, centerY + S(app, app.compact ? 24 : 36)};
         DrawTextIn(dc, L"比较结果将在此显示", line1, app.fPanelHint, kText,
                    DT_CENTER | DT_BOTTOM | DT_SINGLELINE);
-        DrawTextIn(dc, L"A/B/C 为差异报告；报告完成后可在 D 页粘贴新翻译并更新 zh_cn 操作文件。",
+        DrawTextIn(dc, L"A/B/C 差异报告 · D 更新到新 en_us · E 同步到旧 en_us",
                    line2, app.fSmall, kMuted, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
         return;
     }
@@ -831,22 +1011,36 @@ void PaintResults(HDC dc, const App& app) {
 
     const bool compact = app.compact;
     const bool updateTab = app.activeTab == 3;
-    const COLORREF accent = updateTab ? kTargetAccent : TabAccent(app.activeTab);
+    const bool syncTab = app.activeTab == 4;
+    const COLORREF accent = (updateTab || syncTab) ? kTargetAccent : TabAccent(app.activeTab);
     DrawDot(dc, band.left + S(app, compact ? 12 : 18), (band.top + band.bottom) / 2,
             S(app, compact ? 3 : 4), accent);
 
-    const int statsRight = updateTab
-                               ? (app.rcUpdate.left - S(app, 10))
-                               : (band.right - S(app, compact ? 12 : 210));
+    int statsRight = band.right - S(app, compact ? 12 : 210);
+    if (updateTab) {
+        statsRight = app.rcUpdate.left - S(app, 10);
+    } else if (syncTab) {
+        statsRight = app.rcSync.left - S(app, 10);
+    }
     RECT statsRect = {band.left + S(app, compact ? 22 : 32), band.top, statsRight, band.bottom};
-    const std::wstring& statsText = updateTab ? app.dUpdateInfo : app.statText[app.activeTab];
+    const std::wstring& statsText =
+        updateTab ? app.dUpdateInfo : (syncTab ? app.syncInfo : app.statText[app.activeTab]);
     DrawTextIn(dc, statsText, statsRect, app.fUiBold, kText,
                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    if (!compact && !updateTab) {
+    if (!compact && !updateTab && !syncTab) {
         RECT hintRect = {band.right - S(app, 200), band.top, band.right - S(app, 16), band.bottom};
         DrawTextIn(dc, L"纯条目区 · 可直接复制", hintRect, app.fSmall, kMuted,
                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    if (syncTab) {
+        DrawTextIn(dc, compact ? L"模板（可复制）" : L"缺失条目模板（纯条目，可复制后翻译）",
+                   app.rcSyncTemplateCaption, app.fSmallBold, kMuted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextIn(dc, compact ? L"粘贴翻译" : L"粘贴已翻译的缺失条目",
+                   app.rcSyncPasteCaption, app.fSmallBold, kMuted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 }
 
@@ -863,7 +1057,11 @@ void PaintBottom(HDC dc, const App& app) {
     RECT line = {app.rcBottom.left, app.rcBottom.top, app.rcBottom.right, app.rcBottom.top + 1};
     FillSolidRect(dc, line, kBorder);
     if (!app.compact) {
-        DrawTextIn(dc, L"条目顺序：按原文件出现顺序", app.rcBottomHint, app.fSmall, kMuted,
+        const bool targetTab = app.result != nullptr && (app.activeTab == 3 || app.activeTab == 4);
+        DrawTextIn(dc,
+                   targetTab ? L"写回不带 BOM · 校验通过后才修改文件"
+                             : L"条目顺序：按原文件出现顺序",
+                   app.rcBottomHint, app.fSmall, kMuted,
                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 }
@@ -1052,11 +1250,15 @@ void OnZoneFile(App& app, int index, std::wstring path) {
 
     if (index == 2) {
         app.updateApplied = false;
-        UpdateUpdateInfo(app);
+        app.syncApplied = false;
+        if (app.syncPasteEdit != nullptr) {
+            SetWindowTextW(app.syncPasteEdit, L"");
+        }
+        RefreshTargetConsistency(app);
         UpdateActionButtons(app);
         InvalidateRect(app.hwnd, &app.rcStats, FALSE);
         if (app.result != nullptr) {
-            SetStatus(app, L"已选择操作文件，可切换到“D. 更新 zh_cn”粘贴新翻译。");
+            SetStatus(app, L"已选择操作文件；若与旧 en_us 不一致，请先在 E 页同步。");
         } else {
             SetStatus(app, L"已选择 zh_cn 操作文件；完成 en_us 比较后即可更新。");
         }
@@ -1082,7 +1284,11 @@ void ClearZone(App& app, int index) {
     InvalidateRect(app.zoneHwnd[index], nullptr, TRUE);
     if (index == 2) {
         app.updateApplied = false;
-        UpdateUpdateInfo(app);
+        app.syncApplied = false;
+        if (app.syncPasteEdit != nullptr) {
+            SetWindowTextW(app.syncPasteEdit, L"");
+        }
+        RefreshTargetConsistency(app);
         UpdateActionButtons(app);
         SetStatus(app, L"已清空操作文件选择。");
         return;
@@ -1284,6 +1490,51 @@ void ExportReport(App& app) {
     SetStatus(app, std::wstring(L"已导出报告：") + file);
 }
 
+std::wstring GetEditTextW(HWND edit) {
+    if (edit == nullptr) {
+        return std::wstring();
+    }
+    const int length = GetWindowTextLengthW(edit);
+    if (length <= 0) {
+        return std::wstring();
+    }
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    const int copied = GetWindowTextW(edit, text.data(), length + 1);
+    text.resize(copied > 0 ? static_cast<size_t>(copied) : 0);
+    return text;
+}
+
+std::wstring ConsistencyWarning(const mcd::ConsistencyReport& report) {
+    auto join = [](const std::vector<std::string>& keys, size_t maxCount) -> std::wstring {
+        std::wstring text;
+        const size_t shown = std::min(keys.size(), maxCount);
+        for (size_t i = 0; i < shown; ++i) {
+            if (i != 0) {
+                text += L"、";
+            }
+            text += mcd::Utf8ToWide(keys[i]);
+        }
+        if (keys.size() > shown) {
+            text += L" 等";
+        }
+        return text;
+    };
+
+    std::wstring message = L"操作文件与旧 en_us 的键集合不一致，无法更新到新版本。\n\n";
+    if (!report.missing.empty()) {
+        message += L"缺少 " + std::to_wstring(report.missing.size()) + L" 个键：\n" +
+                   join(report.missing, 15) + L"\n\n";
+    }
+    if (!report.extra.empty()) {
+        message += L"多出 " + std::to_wstring(report.extra.size()) + L" 个键：\n" +
+                   join(report.extra, 15) + L"\n\n";
+    }
+    message +=
+        L"请先切换到“E. 同步 zh_cn”，补齐缺失键的翻译并删除多余键；\n"
+        L"同步完成后再回到 D 页更新到新版本。";
+    return message;
+}
+
 void ClearPasteBox(App& app) {
     if (app.pasteEdit == nullptr) {
         return;
@@ -1316,13 +1567,25 @@ void OnUpdateFile(App& app) {
         return;
     }
 
-    const int length = GetWindowTextLengthW(app.pasteEdit);
-    std::wstring pastedWide;
-    if (length > 0) {
-        pastedWide.resize(static_cast<size_t>(length) + 1, L'\0');
-        const int copied = GetWindowTextW(app.pasteEdit, pastedWide.data(), length + 1);
-        pastedWide.resize(copied > 0 ? static_cast<size_t>(copied) : 0);
+    RefreshTargetConsistency(app);
+    if (app.consistency.state == mcd::TargetConsistency::Error) {
+        SetStatus(app, L"更新失败：操作文件读取失败。", kRed);
+        ShowMessage(app.hwnd, mcd::Utf8ToWide(app.consistency.error), MB_ICONERROR);
+        return;
     }
+    if (app.consistency.state == mcd::TargetConsistency::MatchesNew) {
+        SetStatus(app, L"操作文件的键集合已与新 en_us 一致，无需再次更新。");
+        ShowMessage(app.hwnd, L"操作文件的键集合已与新 en_us 一致，无需再次更新。",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    if (app.consistency.state == mcd::TargetConsistency::Mismatch) {
+        SetStatus(app, L"更新失败：操作文件与旧 en_us 版本不一致，请先到 E 页同步。", kRed);
+        ShowMessage(app.hwnd, ConsistencyWarning(app.consistency), MB_ICONWARNING);
+        return;
+    }
+
+    const std::wstring pastedWide = GetEditTextW(app.pasteEdit);
     const std::string pastedUtf8 = mcd::WideToUtf8(pastedWide);
 
     mcd::PastedBlock pasted;
@@ -1359,6 +1622,94 @@ void OnUpdateFile(App& app) {
                                  std::to_wstring(stats.removed) + L" 条，当前共 " +
                                  std::to_wstring(stats.totalAfter) + L" 条。";
     SetStatus(app, summary, kGreen);
+    RefreshTargetConsistency(app);
+    UpdateActionButtons(app);
+    InvalidateRect(app.hwnd, &app.rcStats, FALSE);
+}
+
+void CopySyncTemplate(App& app) {
+    const std::wstring text = GetEditTextW(app.syncTemplateEdit);
+    if (text.empty()) {
+        ShowMessage(app.hwnd, L"当前没有需要新增的缺失条目。", MB_ICONINFORMATION);
+        return;
+    }
+    if (!CopyToClipboard(app.hwnd, text)) {
+        ShowMessage(app.hwnd, L"复制到剪贴板失败。", MB_ICONERROR);
+        return;
+    }
+    SetStatus(app, L"已复制缺失条目模板，请翻译值后粘贴到下方并同步。");
+}
+
+void OnSyncFile(App& app) {
+    if (app.comparing) {
+        return;
+    }
+    if (app.result == nullptr) {
+        ShowMessage(app.hwnd, L"请先完成旧/新 en_us 比较，再同步操作文件。", MB_ICONINFORMATION);
+        return;
+    }
+    if (!app.zones[2].valid) {
+        SetStatus(app, L"同步失败：未选择操作文件。", kRed);
+        ShowMessage(app.hwnd,
+                    L"请先在上方“操作文件 / Target”区域选择 zh_cn 语言文件。",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    if (app.syncApplied) {
+        ShowMessage(app.hwnd, L"本次同步已经完成；如需再次同步，请修改粘贴内容。",
+                    MB_ICONINFORMATION);
+        return;
+    }
+
+    RefreshTargetConsistency(app);
+    if (app.consistency.state == mcd::TargetConsistency::Error) {
+        SetStatus(app, L"同步失败：操作文件读取失败。", kRed);
+        ShowMessage(app.hwnd, mcd::Utf8ToWide(app.consistency.error), MB_ICONERROR);
+        return;
+    }
+    if (app.consistency.state != mcd::TargetConsistency::Mismatch) {
+        ShowMessage(app.hwnd, L"操作文件的键集合已与 en_us 一致，无需同步。",
+                    MB_ICONINFORMATION);
+        return;
+    }
+
+    const std::wstring pastedWide = GetEditTextW(app.syncPasteEdit);
+    const std::string pastedUtf8 = mcd::WideToUtf8(pastedWide);
+
+    mcd::PastedBlock pasted;
+    std::string error;
+    if (!mcd::ParsePastedBlock(pastedUtf8, app.result->format, pasted, error)) {
+        SetStatus(app, L"同步失败：粘贴内容格式不正确，未修改文件。", kRed);
+        ShowMessage(app.hwnd, mcd::Utf8ToWide(error), MB_ICONERROR);
+        return;
+    }
+
+    mcd::UpdateStats stats;
+    if (!mcd::ApplyTargetSync(app.zones[2].path, *app.result, pasted, stats, error)) {
+        SetStatus(app, L"同步失败：未修改操作文件。", kRed);
+        ShowMessage(app.hwnd, mcd::Utf8ToWide(error), MB_ICONERROR);
+        return;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (GetFileAttributesExW(app.zones[2].path.c_str(), GetFileExInfoStandard, &info)) {
+        app.zones[2].bytes = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    }
+    InvalidateRect(app.zoneHwnd[2], nullptr, TRUE);
+
+    SetWindowTextW(app.syncPasteEdit, L"");
+    app.syncInfo = L"已同步 · 新增 " + std::to_wstring(stats.inserted) + L" / 删除 " +
+                   std::to_wstring(stats.removed) + L" · 当前 " +
+                   std::to_wstring(stats.totalAfter) + L" 条";
+    app.syncApplied = true;
+    app.updateApplied = false;
+
+    const std::wstring summary = L"已同步操作文件到旧 en_us：新增 " +
+                                 std::to_wstring(stats.inserted) + L" 条、删除 " +
+                                 std::to_wstring(stats.removed) + L" 条，当前共 " +
+                                 std::to_wstring(stats.totalAfter) + L" 条。";
+    SetStatus(app, summary, kGreen);
+    RefreshTargetConsistency(app);
     UpdateActionButtons(app);
     InvalidateRect(app.hwnd, &app.rcStats, FALSE);
 }
@@ -1503,15 +1854,18 @@ void BuildUi(App& app, HWND hwnd) {
     app.btnExport = CreateOwnerButton(hwnd, kIdExport, L"导出报告");
     app.btnUpdate = CreateOwnerButton(hwnd, kIdUpdateFile, L"更新文件");
     app.btnClearPaste = CreateOwnerButton(hwnd, kIdClearPaste, L"清空粘贴");
+    app.btnCopyTemplate = CreateOwnerButton(hwnd, kIdCopyTemplate, L"复制模板");
+    app.btnSyncFile = CreateOwnerButton(hwnd, kIdSyncFile, L"同步文件");
 
     app.tab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_TABSTOP | TCS_FOCUSNEVER, 0, 0,
                               10, 10, hwnd,
                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdTab)), instance,
                               nullptr);
-    const wchar_t* titles[4] = {L"A. 新增键", L"B. 删除键", L"C. 值变更", L"D. 更新 zh_cn"};
+    const wchar_t* titles[5] = {L"A. 新增键", L"B. 删除键", L"C. 值变更", L"D. 更新 zh_cn",
+                                L"E. 同步 zh_cn"};
     TCITEMW item{};
     item.mask = TCIF_TEXT;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         item.pszText = const_cast<wchar_t*>(titles[i]);
         TabCtrl_InsertItem(app.tab, i, &item);
     }
@@ -1535,6 +1889,17 @@ void BuildUi(App& app, HWND hwnd) {
                      reinterpret_cast<LPARAM>(L"在此粘贴新增/值变更键的新翻译条目…"));
     }
 
+    app.syncTemplateEdit = CreateWindowExW(
+        0, L"EDIT", L"", editStyle, 0, 0, 10, 10, hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSyncTemplateEdit)), instance, nullptr);
+    app.syncPasteEdit = CreateWindowExW(
+        0, L"EDIT", L"", pasteStyle, 0, 0, 10, 10, hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSyncPasteEdit)), instance, nullptr);
+    if (app.syncPasteEdit != nullptr) {
+        SendMessageW(app.syncPasteEdit, EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(L"粘贴缺失键的翻译条目…"));
+    }
+
     app.progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | PBS_MARQUEE, 0, 0, 10, 10,
                                    hwnd,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdProgress)),
@@ -1548,8 +1913,12 @@ void BuildUi(App& app, HWND hwnd) {
         ShowWindow(edit, SW_HIDE);
     }
     ShowWindow(app.pasteEdit, SW_HIDE);
+    ShowWindow(app.syncTemplateEdit, SW_HIDE);
+    ShowWindow(app.syncPasteEdit, SW_HIDE);
     ShowWindow(app.btnUpdate, SW_HIDE);
     ShowWindow(app.btnClearPaste, SW_HIDE);
+    ShowWindow(app.btnCopyTemplate, SW_HIDE);
+    ShowWindow(app.btnSyncFile, SW_HIDE);
     ShowWindow(app.progress, SW_HIDE);
 
     EnableWindow(app.btnCopyBlock, FALSE);
@@ -1558,6 +1927,8 @@ void BuildUi(App& app, HWND hwnd) {
     EnableWindow(app.btnCompare, FALSE);
     EnableWindow(app.btnUpdate, FALSE);
     EnableWindow(app.btnClearPaste, FALSE);
+    EnableWindow(app.btnCopyTemplate, FALSE);
+    EnableWindow(app.btnSyncFile, FALSE);
 
     app.status = L"就绪：拖入旧/新 en_us 与 zh_cn 操作文件，然后比较。";
     DragAcceptFiles(hwnd, TRUE);
@@ -1637,6 +2008,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                     UpdateActionButtons(*app);
                     return 0;
                 }
+                if (HIWORD(wParam) == EN_CHANGE && LOWORD(wParam) == kIdSyncPasteEdit) {
+                    app->syncApplied = false;
+                    UpdateSyncInfo(*app);
+                    UpdateActionButtons(*app);
+                    return 0;
+                }
                 switch (LOWORD(wParam)) {
                     case kIdClearOld: ClearZone(*app, 0); return 0;
                     case kIdClearNew: ClearZone(*app, 1); return 0;
@@ -1648,6 +2025,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                     case kIdExport: ExportReport(*app); return 0;
                     case kIdUpdateFile: OnUpdateFile(*app); return 0;
                     case kIdClearPaste: ClearPasteBox(*app); return 0;
+                    case kIdCopyTemplate: CopySyncTemplate(*app); return 0;
+                    case kIdSyncFile: OnSyncFile(*app); return 0;
                     default: break;
                 }
             }
@@ -1657,7 +2036,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             if (app != nullptr && header != nullptr && header->hwndFrom == app->tab &&
                 header->code == TCN_SELCHANGE) {
                 const int selected = TabCtrl_GetCurSel(app->tab);
-                app->activeTab = (selected >= 0 && selected <= 3) ? selected : 0;
+                app->activeTab = (selected >= 0 && selected <= 4) ? selected : 0;
                 ShowActiveBlock(*app);
             }
             return 0;

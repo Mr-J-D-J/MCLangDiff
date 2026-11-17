@@ -256,13 +256,126 @@ int wmain() {
     CHECK(mcd::ParsePastedBlock(updateJsonText, mcd::FileFormat::Json, updateJson, err));
     CHECK_SIZE(updateJson.entries.size(), 5);
 
+    // 操作文件是旧版本的局部翻译：与旧 en_us 的键集合不一致。
+    mcd::ConsistencyReport jsonConsistency;
+    CHECK(mcd::CheckTargetConsistency(targetJson, *jsonDiff, jsonConsistency));
+    CHECK(jsonConsistency.state == mcd::TargetConsistency::Mismatch);
+    CHECK_SIZE(jsonConsistency.missing.size(), 8);
+    CHECK_SIZE(jsonConsistency.extra.size(), 1);
+    CHECK(jsonConsistency.missing[0] == "item.demo.pickaxe.name");
+    CHECK(jsonConsistency.missing[1] == "block.demo.ore.name");
+    CHECK(jsonConsistency.missing[2] == "message.demo.farewell");
+    CHECK(jsonConsistency.missing[3] == "tooltip.demo.tip");
+    CHECK(jsonConsistency.missing[4] == "item.demo.quoted.name");
+    CHECK(jsonConsistency.missing[5] == "message.demo.quote");
+    CHECK(jsonConsistency.missing[6] == "item.demo.unicode.name");
+    CHECK(jsonConsistency.missing[7] == "item.demo.emoji.name");
+    CHECK(jsonConsistency.extra[0] == "item.demo.extra.name");
+
+    std::string templateJson;
+    CHECK(mcd::BuildMissingEntriesTemplate(*jsonDiff, jsonConsistency, templateJson));
+    CHECK_CONTAINS(templateJson, "\"item.demo.pickaxe.name\": \"演示镐\"");
+    CHECK_CONTAINS(templateJson, "\"item.demo.emoji.name\": \"钻石 ⛏\"");
+    CHECK_NOT_CONTAINS(templateJson, "item.demo.extra.name");
+    CHECK_NOT_CONTAINS(templateJson, "统计");
+    CHECK_BEFORE(templateJson, "item.demo.pickaxe.name", "block.demo.ore.name");
+
+    // 不一致时，D 更新必须被拒绝且文件不变。
+    const std::wstring guardJson = PathJoin(tmpDir, L"zh_cn_guard.json");
+    CHECK(CopyFileW(sampleJsonTarget.c_str(), guardJson.c_str(), FALSE) != FALSE);
+    std::string guardBefore;
+    CHECK(mcd::ReadFileBytes(guardJson, guardBefore, mcd::kMaxFileBytes, err));
+    mcd::UpdateStats ignoredStats;
+    CHECK(!mcd::ApplyTranslationUpdate(guardJson, *jsonDiff, updateJson, ignoredStats, err));
+    CHECK_CONTAINS(err, "键集合不一致");
+    CHECK_CONTAINS(err, "缺少 8 个键");
+    CHECK_CONTAINS(err, "多出 1 个键");
+    CHECK_CONTAINS(err, "E 页");
+    std::string guardAfter;
+    CHECK(mcd::ReadFileBytes(guardJson, guardAfter, mcd::kMaxFileBytes, err));
+    CHECK(guardBefore == guardAfter);
+
+    // E 页同步：补齐旧 en_us 缺失的 8 个键，并删除多余的 1 个键。
+    mcd::PastedBlock syncJson;
+    const std::string syncJsonText =
+        "\"block.demo.ore.name\": \"深板岩矿石\",\n"
+        "\"item.demo.pickaxe.name\": \"演示镐\",\n"
+        "\"message.demo.farewell\": \"再见，旅行者。\",\n"
+        "\"tooltip.demo.tip\": \"提示：按 Shift 查看详情\",\n"
+        "\"item.demo.quoted.name\": \"带“引号”的名称\",\n"
+        "\"message.demo.quote\": \"他说：\\\"你好\\\"\",\n"
+        "\"item.demo.unicode.name\": \"中文\",\n"
+        "\"item.demo.emoji.name\": \"钻石 ⛏\"";
+    CHECK(mcd::ParsePastedBlock(syncJsonText, mcd::FileFormat::Json, syncJson, err));
+    CHECK_SIZE(syncJson.entries.size(), 8);
+
+    mcd::UpdateStats syncStats;
+    CHECK(mcd::ApplyTargetSync(targetJson, *jsonDiff, syncJson, syncStats, err));
+    CHECK_SIZE(syncStats.inserted, 8);
+    CHECK_SIZE(syncStats.updated, 0);
+    CHECK_SIZE(syncStats.removed, 1);
+    CHECK_SIZE(syncStats.untouched, 8);
+    CHECK_SIZE(syncStats.totalAfter, 16);
+
+    std::string syncedJsonBytes;
+    CHECK(mcd::ReadFileBytes(targetJson, syncedJsonBytes, mcd::kMaxFileBytes, err));
+    CHECK(!(syncedJsonBytes.size() >= 3 &&
+            static_cast<unsigned char>(syncedJsonBytes[0]) == 0xEF &&
+            static_cast<unsigned char>(syncedJsonBytes[1]) == 0xBB &&
+            static_cast<unsigned char>(syncedJsonBytes[2]) == 0xBF));
+    auto syncedJson = std::make_unique<mcd::LangFile>();
+    CHECK(mcd::LoadLangFile(targetJson, mcd::FileFormat::Json, *syncedJson, err));
+    CHECK_SIZE(syncedJson->entries.size(), 16);
+    auto syncEntryIndex = [&syncedJson](std::string_view key) -> int {
+        const auto it = syncedJson->index.find(key);
+        return it == syncedJson->index.end() ? -1 : static_cast<int>(it->second);
+    };
+    CHECK(syncEntryIndex("item.demo.sword.name") == 0);
+    CHECK(syncEntryIndex("item.demo.pickaxe.name") == 1);
+    CHECK(syncEntryIndex("block.demo.ore.name") == 4);
+    CHECK(syncEntryIndex("message.demo.quote") == 13);
+    CHECK(syncEntryIndex("item.demo.emoji.name") == 15);
+    CHECK(syncEntryIndex("item.demo.extra.name") == -1);
+    CHECK(syncedJson->entries[1].value == "演示镐");
+    CHECK(syncedJson->entries[13].value == "他说：\"你好\"");
+    CHECK(syncedJson->entries[15].value == "钻石 ⛏");
+    CHECK(mcd::CheckTargetConsistency(targetJson, *jsonDiff, jsonConsistency));
+    CHECK(jsonConsistency.state == mcd::TargetConsistency::MatchesOld);
+    CHECK_SIZE(jsonConsistency.missing.size(), 0);
+    CHECK_SIZE(jsonConsistency.extra.size(), 0);
+
+    // 同步后，D 页的缺键/未知键校验必须拒绝且不写入。
+    mcd::PastedBlock missingJson;
+    CHECK(mcd::ParsePastedBlock(
+        "\"block.demo.new_block.name\": \"新方块\",\n"
+        "\"gui.demo.close\": \"关闭界面\",\n"
+        "\"item.demo.pickaxe.name\": \"演示镐（强化）\"",
+        mcd::FileFormat::Json, missingJson, err));
+    std::string syncedBefore;
+    CHECK(mcd::ReadFileBytes(targetJson, syncedBefore, mcd::kMaxFileBytes, err));
+    CHECK(!mcd::ApplyTranslationUpdate(targetJson, *jsonDiff, missingJson, ignoredStats, err));
+    CHECK_CONTAINS(err, "缺少");
+    CHECK_CONTAINS(err, "item.demo.new_only.name");
+    std::string afterFailure;
+    CHECK(mcd::ReadFileBytes(targetJson, afterFailure, mcd::kMaxFileBytes, err));
+    CHECK(syncedBefore == afterFailure);
+
+    mcd::PastedBlock unknownJson;
+    CHECK(mcd::ParsePastedBlock(updateJsonText + ",\n\"item.demo.sword.name\": \"演示之剑\"",
+                                mcd::FileFormat::Json, unknownJson, err));
+    CHECK(!mcd::ApplyTranslationUpdate(targetJson, *jsonDiff, unknownJson, ignoredStats, err));
+    CHECK_CONTAINS(err, "不属于本次需要粘贴的键");
+    CHECK(mcd::ReadFileBytes(targetJson, afterFailure, mcd::kMaxFileBytes, err));
+    CHECK(syncedBefore == afterFailure);
+
+    // 同步后的正常 D 更新。
     mcd::UpdateStats jsonStats;
     CHECK(mcd::ApplyTranslationUpdate(targetJson, *jsonDiff, updateJson, jsonStats, err));
-    CHECK_SIZE(jsonStats.inserted, 4);
-    CHECK_SIZE(jsonStats.updated, 1);
+    CHECK_SIZE(jsonStats.inserted, 3);
+    CHECK_SIZE(jsonStats.updated, 2);
     CHECK_SIZE(jsonStats.removed, 2);
-    CHECK_SIZE(jsonStats.untouched, 6);
-    CHECK_SIZE(jsonStats.totalAfter, 11);
+    CHECK_SIZE(jsonStats.untouched, 12);
+    CHECK_SIZE(jsonStats.totalAfter, 17);
 
     std::string updatedJsonBytes;
     CHECK(mcd::ReadFileBytes(targetJson, updatedJsonBytes, mcd::kMaxFileBytes, err));
@@ -274,7 +387,7 @@ int wmain() {
 
     auto updatedJson = std::make_unique<mcd::LangFile>();
     CHECK(mcd::LoadLangFile(targetJson, mcd::FileFormat::Json, *updatedJson, err));
-    CHECK_SIZE(updatedJson->entries.size(), 11);
+    CHECK_SIZE(updatedJson->entries.size(), 17);
     auto jsonEntryIndex = [&updatedJson](std::string_view key) -> int {
         const auto it = updatedJson->index.find(key);
         return it == updatedJson->index.end() ? -1 : static_cast<int>(it->second);
@@ -283,70 +396,51 @@ int wmain() {
     CHECK(jsonEntryIndex("item.demo.pickaxe.name") == 1);
     CHECK(jsonEntryIndex("item.demo.gem.name") == 2);
     CHECK(jsonEntryIndex("block.demo.lamp.name") == 3);
-    CHECK(jsonEntryIndex("block.demo.new_block.name") == 4);
-    CHECK(jsonEntryIndex("gui.demo.title") == 5);
-    CHECK(jsonEntryIndex("gui.demo.close") == 6);
-    CHECK(jsonEntryIndex("gui.demo.settings") == 7);
-    CHECK(jsonEntryIndex("message.demo.welcome") == 8);
-    CHECK(jsonEntryIndex("item.demo.new_only.name") == 9);
-    CHECK(jsonEntryIndex("item.demo.extra.name") == 10);
+    CHECK(jsonEntryIndex("block.demo.ore.name") == 4);
+    CHECK(jsonEntryIndex("block.demo.new_block.name") == 5);
+    CHECK(jsonEntryIndex("gui.demo.title") == 6);
+    CHECK(jsonEntryIndex("gui.demo.close") == 7);
+    CHECK(jsonEntryIndex("gui.demo.settings") == 8);
+    CHECK(jsonEntryIndex("message.demo.welcome") == 9);
+    CHECK(jsonEntryIndex("message.demo.farewell") == 10);
+    CHECK(jsonEntryIndex("tooltip.demo.tip") == 11);
+    CHECK(jsonEntryIndex("item.demo.quoted.name") == 12);
+    CHECK(jsonEntryIndex("message.demo.quote") == 13);
+    CHECK(jsonEntryIndex("item.demo.unicode.name") == 14);
+    CHECK(jsonEntryIndex("item.demo.emoji.name") == 15);
+    CHECK(jsonEntryIndex("item.demo.new_only.name") == 16);
     CHECK(jsonEntryIndex("gui.demo.legacy") == -1);
     CHECK(jsonEntryIndex("item.demo.old_only.name") == -1);
-    CHECK(updatedJson->entries[6].value == "关闭界面");
-    CHECK(updatedJson->entries[7].value == "设置");
-    CHECK(updatedJson->entries[10].raw == "\"item.demo.extra.name\": \"中文额外条目\"");
-    CHECK(updatedJson->entries[10].lead == "\n  ");
-    CHECK(updatedJson->entries[9].lead == "\n  ");
-    CHECK(updatedJson->entries[9].raw == "\"item.demo.new_only.name\" : \"仅存在于新文件\"");
+    CHECK(jsonEntryIndex("item.demo.extra.name") == -1);
+    CHECK(updatedJson->entries[1].value == "演示镐（强化）");
+    CHECK(updatedJson->entries[7].value == "关闭界面");
+    CHECK(updatedJson->entries[8].value == "设置");
+    CHECK(updatedJson->entries[16].value == "仅存在于新文件");
+    CHECK(updatedJson->entries[16].lead == "\n  ");
+    CHECK(updatedJson->entries[12].raw == "\"item.demo.quoted.name\": \"带“引号”的名称\"");
+    CHECK(mcd::CheckTargetConsistency(targetJson, *jsonDiff, jsonConsistency));
+    CHECK(jsonConsistency.state == mcd::TargetConsistency::MatchesNew);
 
-    std::printf("== 更新校验与失败保护 ==\n");
-    const std::wstring guardJson = PathJoin(tmpDir, L"zh_cn_guard.json");
-    CHECK(CopyFileW(sampleJsonTarget.c_str(), guardJson.c_str(), FALSE) != FALSE);
-    std::string guardBefore;
-    CHECK(mcd::ReadFileBytes(guardJson, guardBefore, mcd::kMaxFileBytes, err));
-
-    mcd::PastedBlock missingBlock;
-    CHECK(mcd::ParsePastedBlock(
-        "\"block.demo.new_block.name\": \"新方块\",\n"
-        "\"gui.demo.close\": \"关闭界面\",\n"
-        "\"item.demo.pickaxe.name\": \"演示镐（强化）\"",
-        mcd::FileFormat::Json, missingBlock, err));
-    mcd::UpdateStats ignoredStats;
-    CHECK(!mcd::ApplyTranslationUpdate(guardJson, *jsonDiff, missingBlock, ignoredStats, err));
-    CHECK_CONTAINS(err, "缺少");
-    CHECK_CONTAINS(err, "item.demo.new_only.name");
-    std::string guardAfter;
-    CHECK(mcd::ReadFileBytes(guardJson, guardAfter, mcd::kMaxFileBytes, err));
-    CHECK(guardBefore == guardAfter);
-
-    mcd::PastedBlock unknownBlock;
-    CHECK(mcd::ParsePastedBlock(updateJsonText + ",\n\"item.demo.gem.name\": \"红宝石\"",
-                                mcd::FileFormat::Json, unknownBlock, err));
-    CHECK(!mcd::ApplyTranslationUpdate(guardJson, *jsonDiff, unknownBlock, ignoredStats, err));
-    CHECK_CONTAINS(err, "不在新增/值变更");
-    CHECK(mcd::ReadFileBytes(guardJson, guardAfter, mcd::kMaxFileBytes, err));
-    CHECK(guardBefore == guardAfter);
+    std::printf("== 同步写入：无 BOM ==\n");
+    const std::wstring bomTarget = PathJoin(tmpDir, L"zh_cn_bom.json");
+    std::string sampleJsonBytes;
+    CHECK(mcd::ReadFileBytes(sampleJsonTarget, sampleJsonBytes, mcd::kMaxFileBytes, err));
+    CHECK(WriteBytes(bomTarget, std::string("\xEF\xBB\xBF") + sampleJsonBytes));
+    mcd::UpdateStats bomStats;
+    CHECK(mcd::ApplyTargetSync(bomTarget, *jsonDiff, syncJson, bomStats, err));
+    std::string bomBytes;
+    CHECK(mcd::ReadFileBytes(bomTarget, bomBytes, mcd::kMaxFileBytes, err));
+    CHECK(!(bomBytes.size() >= 3 && static_cast<unsigned char>(bomBytes[0]) == 0xEF &&
+            static_cast<unsigned char>(bomBytes[1]) == 0xBB &&
+            static_cast<unsigned char>(bomBytes[2]) == 0xBF));
+    CHECK_CONTAINS(bomBytes, "\"item.demo.emoji.name\": \"钻石 ⛏\"");
 
     mcd::UpdateStats mismatchStats;
     CHECK(!mcd::ApplyTranslationUpdate(samples + L"\\zh_cn.lang", *jsonDiff, updateJson,
                                        mismatchStats, err));
     CHECK_CONTAINS(err, "格式不一致");
 
-    std::printf("== 更新写入：无 BOM ==\n");
-    const std::wstring bomTarget = PathJoin(tmpDir, L"zh_cn_bom.json");
-    std::string sampleJsonBytes;
-    CHECK(mcd::ReadFileBytes(sampleJsonTarget, sampleJsonBytes, mcd::kMaxFileBytes, err));
-    CHECK(WriteBytes(bomTarget, std::string("\xEF\xBB\xBF") + sampleJsonBytes));
-    mcd::UpdateStats bomStats;
-    CHECK(mcd::ApplyTranslationUpdate(bomTarget, *jsonDiff, updateJson, bomStats, err));
-    std::string bomBytes;
-    CHECK(mcd::ReadFileBytes(bomTarget, bomBytes, mcd::kMaxFileBytes, err));
-    CHECK(!(bomBytes.size() >= 3 && static_cast<unsigned char>(bomBytes[0]) == 0xEF &&
-            static_cast<unsigned char>(bomBytes[1]) == 0xBB &&
-            static_cast<unsigned char>(bomBytes[2]) == 0xBF));
-    CHECK_CONTAINS(bomBytes, "\"item.demo.new_only.name\" : \"仅存在于新文件\"");
-
-    std::printf("== 更新操作文件（LANG，CRLF 与注释保留） ==\n");
+    std::printf("== 更新操作文件（LANG：先同步再更新，保留注释与 CRLF） ==\n");
     const std::wstring sampleLangTarget = samples + L"\\zh_cn.lang";
     const std::wstring targetLang = PathJoin(tmpDir, L"zh_cn.lang");
     std::string sampleLangBytes;
@@ -362,6 +456,18 @@ int wmain() {
     }
     CHECK(WriteBytes(targetLang, crlfBytes));
 
+    mcd::ConsistencyReport langConsistency;
+    CHECK(mcd::CheckTargetConsistency(targetLang, *langDiff, langConsistency));
+    CHECK(langConsistency.state == mcd::TargetConsistency::Mismatch);
+    CHECK_SIZE(langConsistency.missing.size(), 5);
+    CHECK_SIZE(langConsistency.extra.size(), 1);
+
+    std::string templateLang;
+    CHECK(mcd::BuildMissingEntriesTemplate(*langDiff, langConsistency, templateLang));
+    CHECK_CONTAINS(templateLang, "item.demo.pickaxe.name=演示镐");
+    CHECK_CONTAINS(templateLang, "item.demo.emoji.name=钻石 ⛏");
+    CHECK_NOT_CONTAINS(templateLang, "##");
+
     mcd::PastedBlock updateLang;
     const std::string updateLangText =
         "item.demo.pickaxe.name=演示镐（强化）\n"
@@ -372,13 +478,62 @@ int wmain() {
     CHECK(mcd::ParsePastedBlock(updateLangText, mcd::FileFormat::Lang, updateLang, err));
     CHECK_SIZE(updateLang.entries.size(), 5);
 
+    std::string langBefore;
+    CHECK(mcd::ReadFileBytes(targetLang, langBefore, mcd::kMaxFileBytes, err));
+    mcd::UpdateStats blockedLangStats;
+    CHECK(!mcd::ApplyTranslationUpdate(targetLang, *langDiff, updateLang, blockedLangStats, err));
+    CHECK_CONTAINS(err, "键集合不一致");
+    std::string langAfterBlocked;
+    CHECK(mcd::ReadFileBytes(targetLang, langAfterBlocked, mcd::kMaxFileBytes, err));
+    CHECK(langBefore == langAfterBlocked);
+
+    mcd::PastedBlock syncLang;
+    const std::string syncLangText =
+        "item.demo.pickaxe.name=演示镐\n"
+        "block.demo.ore.name=深板岩矿石\n"
+        "message.demo.farewell=再见，旅行者。\n"
+        "tooltip.demo.tip=提示：按 Shift 查看详情\n"
+        "item.demo.emoji.name=钻石 ⛏\n";
+    CHECK(mcd::ParsePastedBlock(syncLangText, mcd::FileFormat::Lang, syncLang, err));
+    CHECK_SIZE(syncLang.entries.size(), 5);
+
+    mcd::UpdateStats langSyncStats;
+    CHECK(mcd::ApplyTargetSync(targetLang, *langDiff, syncLang, langSyncStats, err));
+    CHECK_SIZE(langSyncStats.inserted, 5);
+    CHECK_SIZE(langSyncStats.updated, 0);
+    CHECK_SIZE(langSyncStats.removed, 1);
+    CHECK_SIZE(langSyncStats.untouched, 8);
+    CHECK_SIZE(langSyncStats.totalAfter, 13);
+    CHECK(mcd::CheckTargetConsistency(targetLang, *langDiff, langConsistency));
+    CHECK(langConsistency.state == mcd::TargetConsistency::MatchesOld);
+
+    std::string syncedLangBytes;
+    CHECK(mcd::ReadFileBytes(targetLang, syncedLangBytes, mcd::kMaxFileBytes, err));
+    size_t syncedLoneLf = 0;
+    for (size_t i = 0; i < syncedLangBytes.size(); ++i) {
+        if (syncedLangBytes[i] == '\n' && (i == 0 || syncedLangBytes[i - 1] != '\r')) {
+            ++syncedLoneLf;
+        }
+    }
+    CHECK_SIZE(syncedLoneLf, 0);
+    CHECK_CONTAINS(syncedLangBytes, "## zh_cn 操作文件示例");
+    CHECK_CONTAINS(syncedLangBytes,
+                   "item.demo.sword.name=演示之剑\r\nitem.demo.pickaxe.name=演示镐\r\n"
+                   "item.demo.gem.name=红宝石\r\nblock.demo.lamp.name=红石灯\r\n"
+                   "block.demo.ore.name=深板岩矿石\r\ngui.demo.title=演示界面");
+    CHECK_CONTAINS(syncedLangBytes,
+                   "tooltip.demo.tip=提示：按 Shift 查看详情\r\n"
+                   "item.demo.old_only.name=仅存在于旧文件\r\n"
+                   "item.demo.emoji.name=钻石 ⛏");
+    CHECK_NOT_CONTAINS(syncedLangBytes, "item.demo.extra.name");
+
     mcd::UpdateStats langStats;
     CHECK(mcd::ApplyTranslationUpdate(targetLang, *langDiff, updateLang, langStats, err));
-    CHECK_SIZE(langStats.inserted, 4);
-    CHECK_SIZE(langStats.updated, 1);
+    CHECK_SIZE(langStats.inserted, 3);
+    CHECK_SIZE(langStats.updated, 2);
     CHECK_SIZE(langStats.removed, 2);
-    CHECK_SIZE(langStats.untouched, 6);
-    CHECK_SIZE(langStats.totalAfter, 11);
+    CHECK_SIZE(langStats.untouched, 9);
+    CHECK_SIZE(langStats.totalAfter, 14);
 
     std::string updatedLangBytes;
     CHECK(mcd::ReadFileBytes(targetLang, updatedLangBytes, mcd::kMaxFileBytes, err));
@@ -395,21 +550,28 @@ int wmain() {
                    "item.demo.sword.name=演示之剑\r\nitem.demo.pickaxe.name=演示镐（强化）\r\n"
                    "item.demo.gem.name=红宝石");
     CHECK_CONTAINS(updatedLangBytes,
+                   "block.demo.ore.name=深板岩矿石\r\nblock.demo.new_block.name=新方块\r\n"
+                   "gui.demo.title=演示界面");
+    CHECK_CONTAINS(updatedLangBytes,
                    "gui.demo.title=演示界面\r\ngui.demo.close=关闭界面\r\n"
                    "gui.demo.settings=设置\r\nmessage.demo.welcome=欢迎来到演示世界！");
     CHECK_CONTAINS(updatedLangBytes,
-                   "message.demo.welcome=欢迎来到演示世界！\r\nitem.demo.new_only.name=仅存在于新文件\r\n"
-                   "item.demo.extra.name=中文额外条目");
+                   "tooltip.demo.tip=提示：按 Shift 查看详情\r\nitem.demo.emoji.name=钻石 ⛏\r\n"
+                   "item.demo.new_only.name=仅存在于新文件");
     CHECK_NOT_CONTAINS(updatedLangBytes, "gui.demo.legacy");
     CHECK_NOT_CONTAINS(updatedLangBytes, "item.demo.old_only.name");
+    CHECK_NOT_CONTAINS(updatedLangBytes, "item.demo.extra.name");
 
     auto updatedLang = std::make_unique<mcd::LangFile>();
     CHECK(mcd::LoadLangFile(targetLang, mcd::FileFormat::Lang, *updatedLang, err));
-    CHECK_SIZE(updatedLang->entries.size(), 11);
+    CHECK_SIZE(updatedLang->entries.size(), 14);
     CHECK(updatedLang->entries[1].key == "item.demo.pickaxe.name");
     CHECK(updatedLang->entries[1].value == "演示镐（强化）");
+    CHECK(updatedLang->entries[13].key == "item.demo.new_only.name");
+    CHECK(mcd::CheckTargetConsistency(targetLang, *langDiff, langConsistency));
+    CHECK(langConsistency.state == mcd::TargetConsistency::MatchesNew);
 
-    std::printf("== 更新操作文件（LANG，保留无末尾换行） ==\n");
+    std::printf("== 同步操作文件（LANG，保留无末尾换行） ==\n");
     const std::wstring noEolLang = PathJoin(tmpDir, L"zh_cn_no_eol.lang");
     std::string noEolBytes = sampleLangBytes;
     while (!noEolBytes.empty() && (noEolBytes.back() == '\n' || noEolBytes.back() == '\r')) {
@@ -417,11 +579,14 @@ int wmain() {
     }
     CHECK(WriteBytes(noEolLang, noEolBytes));
     mcd::UpdateStats noEolStats;
-    CHECK(mcd::ApplyTranslationUpdate(noEolLang, *langDiff, updateLang, noEolStats, err));
+    CHECK(mcd::ApplyTargetSync(noEolLang, *langDiff, syncLang, noEolStats, err));
     std::string noEolAfter;
     CHECK(mcd::ReadFileBytes(noEolLang, noEolAfter, mcd::kMaxFileBytes, err));
     CHECK(!noEolAfter.empty() && noEolAfter.back() != '\n');
-    CHECK_CONTAINS(noEolAfter, "item.demo.extra.name=中文额外条目");
+    CHECK_CONTAINS(noEolAfter, "item.demo.emoji.name=钻石 ⛏");
+    auto noEolFile = std::make_unique<mcd::LangFile>();
+    CHECK(mcd::LoadLangFile(noEolLang, mcd::FileFormat::Lang, *noEolFile, err));
+    CHECK_SIZE(noEolFile->entries.size(), 13);
 
     std::printf("== 错误处理 ==\n");
     std::unique_ptr<mcd::DiffResult> mismatch;
